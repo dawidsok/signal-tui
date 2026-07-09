@@ -42,11 +42,14 @@ cargo build --release
 | Up / Down | Navigate contacts (contacts focus) |
 | / | Search contacts; type a new number and Enter to start a chat |
 | i / Enter | Open selected chat |
+| f | Toggle favorite for selected/open chat |
 | Enter | Send message (input focus) |
 | q | Quit (contacts focus) |
 | Ctrl-C | Quit (any focus) |
 
 A **Note to Self** chat is added automatically from your linked Signal account, so you can test without messaging other people.
+
+Contact markers: `*` = unread, `★` = favorite. Favorites are stored locally in `~/.config/signal-tui/favorites`.
 
 ## Slash commands
 
@@ -58,3 +61,5 @@ Type these in the message input:
 | `/chat <number>` | Open/start a chat with a phone number |
 | `/new <number>` | Alias for `/chat` |
 | `/self` or `/me` | Open Note to Self |
+| `/fav` or `/favorite` | Favorite selected/open chat |
+| `/unfav` or `/unfavorite` | Remove selected/open chat from favorites |

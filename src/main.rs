@@ -8,7 +8,9 @@ use ratatui::{
 };
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -50,6 +52,7 @@ struct App {
     // monotonic counter per contact: higher = more recently messaged
     last_msg_seq: HashMap<String, usize>,
     unread: HashSet<String>,
+    favorites: HashSet<String>,
     msg_seq: usize,
     input: String,
     focus: Focus,
@@ -74,11 +77,12 @@ impl App {
                 .filter(|c| c.name.to_lowercase().contains(&q) || c.id.to_lowercase().contains(&q))
                 .collect()
         };
-        // sort by most recently messaged; contacts never messaged go to bottom
         contacts.sort_by(|a, b| {
+            let fa = self.favorites.contains(&a.id);
+            let fb = self.favorites.contains(&b.id);
             let sa = self.last_msg_seq.get(&a.id).copied().unwrap_or(0);
             let sb = self.last_msg_seq.get(&b.id).copied().unwrap_or(0);
-            sb.cmp(&sa)
+            fb.cmp(&fa).then_with(|| sb.cmp(&sa))
         });
         contacts
     }
@@ -87,6 +91,52 @@ impl App {
 fn rpc(stdin: &mut impl Write, id: u64, method: &str, params: Value) {
     let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
     let _ = writeln!(stdin, "{}", req);
+}
+
+fn config_dir() -> Option<PathBuf> {
+    std::env::var_os("SIGNAL_TUI_CONFIG")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/signal-tui")))
+}
+
+fn favorites_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("favorites"))
+}
+
+fn read_favorites(path: &Path) -> std::io::Result<HashSet<String>> {
+    match fs::read_to_string(path) {
+        Ok(s) => Ok(s
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashSet::new()),
+        Err(e) => Err(e),
+    }
+}
+
+fn write_favorites(path: &Path, favorites: &HashSet<String>) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut lines: Vec<&str> = favorites.iter().map(String::as_str).collect();
+    lines.sort_unstable();
+    fs::write(path, lines.join("\n"))
+}
+
+fn load_favorites() -> HashSet<String> {
+    favorites_path()
+        .and_then(|p| read_favorites(&p).ok())
+        .unwrap_or_default()
+}
+
+fn save_favorites(app: &mut App) {
+    if let Some(path) = favorites_path()
+        && let Err(e) = write_favorites(&path, &app.favorites)
+    {
+        app.status = format!("favorites not saved: {e}");
+    }
 }
 
 fn parse_linked_account(stdout: &str) -> Option<String> {
@@ -174,6 +224,7 @@ fn main() -> std::io::Result<()> {
         messages: vec![],
         last_msg_seq: HashMap::new(),
         unread: HashSet::new(),
+        favorites: load_favorites(),
         msg_seq: 0,
         input: String::new(),
         focus: Focus::List,
@@ -288,6 +339,10 @@ fn run(
                             app.selected.select(Some(max));
                             false
                         }
+                        KeyCode::Char('f') => {
+                            toggle_favorite(app);
+                            false
+                        }
                         _ => false,
                     };
                 }
@@ -321,10 +376,35 @@ fn add_contact_once(app: &mut App, id: String, name: String, is_group: bool) {
     }
 }
 
+fn current_chat_id(app: &App) -> Option<String> {
+    app.open_id.clone().or_else(|| {
+        app.selected
+            .selected()
+            .and_then(|i| app.filtered().get(i).map(|c| c.id.clone()))
+    })
+}
+
 fn open_chat(app: &mut App, id: String) {
     app.unread.remove(&id);
     app.open_id = Some(id);
     app.focus = Focus::Input;
+}
+
+fn set_favorite(app: &mut App, id: String, favorite: bool) {
+    if favorite {
+        app.favorites.insert(id.clone());
+        app.status = format!("favorited: {id}");
+    } else {
+        app.favorites.remove(&id);
+        app.status = format!("unfavorited: {id}");
+    }
+    save_favorites(app);
+}
+
+fn toggle_favorite(app: &mut App) {
+    if let Some(id) = current_chat_id(app) {
+        set_favorite(app, id.clone(), !app.favorites.contains(&id));
+    }
 }
 
 fn open_selected_contact(app: &mut App) {
@@ -368,7 +448,7 @@ fn record_message(app: &mut App, cid: String, from: String, text: &str) {
 fn handle_command(app: &mut App, command: &str) {
     let mut parts = command.split_whitespace();
     match parts.next().unwrap_or("") {
-        "/help" => app.status = "commands: /chat <number>, /self".into(),
+        "/help" => app.status = "commands: /chat <number>, /self, /fav, /unfav".into(),
         "/chat" | "/new" => match parts.next() {
             Some(id) => {
                 add_contact_once(app, id.into(), id.into(), false);
@@ -386,6 +466,14 @@ fn handle_command(app: &mut App, command: &str) {
                 app.status = "chat: Note to Self".into();
             }
             None => app.status = "no linked account for /self".into(),
+        },
+        "/fav" | "/favorite" => match current_chat_id(app) {
+            Some(id) => set_favorite(app, id, true),
+            None => app.status = "no chat to favorite".into(),
+        },
+        "/unfav" | "/unfavorite" => match current_chat_id(app) {
+            Some(id) => set_favorite(app, id, false),
+            None => app.status = "no chat to unfavorite".into(),
         },
         other => app.status = format!("unknown command: {other}"),
     }
@@ -565,10 +653,19 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
             } else {
                 name.clone()
             };
-            let label = if app.unread.contains(id) {
-                format!("* {label}")
-            } else {
+            let markers = format!(
+                "{}{}",
+                if app.unread.contains(id) { "*" } else { "" },
+                if app.favorites.contains(id) {
+                    "★"
+                } else {
+                    ""
+                }
+            );
+            let label = if markers.is_empty() {
                 label
+            } else {
+                format!("{markers} {label}")
             };
             ListItem::new(label).style(Style::default().fg(FG))
         })
@@ -689,6 +786,7 @@ mod tests {
             messages: vec![],
             last_msg_seq: HashMap::new(),
             unread: HashSet::new(),
+            favorites: HashSet::new(),
             msg_seq: 0,
             input: String::new(),
             focus: Focus::List,
@@ -727,13 +825,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn favorites_file_roundtrip() {
+        let path =
+            std::env::temp_dir().join(format!("signal-tui-favorites-{}", std::process::id()));
+        let favorites = HashSet::from(["+2".to_string(), "+1".to_string()]);
+        write_favorites(&path, &favorites).unwrap();
+        assert_eq!(read_favorites(&path).unwrap(), favorites);
+        let _ = fs::remove_file(path);
+    }
+
     /// Simulate pressing i/Enter on the currently highlighted contact.
     fn open_selected(app: &mut App) {
-        app.open_id = app
-            .selected
-            .selected()
-            .and_then(|i| app.filtered().get(i).map(|c| c.id.clone()));
-        app.focus = Focus::Input;
+        open_selected_contact(app);
     }
 
     // ── send_message ──────────────────────────────────────────────────────────
@@ -888,6 +992,23 @@ mod tests {
         add_contact(&mut app, "+1", "Alice");
         app.unread.insert("+1".into());
         assert!(screen_text(&mut app).contains("* Alice"));
+    }
+
+    #[test]
+    fn draw_marks_favorite_contacts() {
+        let mut app = make_app();
+        add_contact(&mut app, "+1", "Alice");
+        app.favorites.insert("+1".into());
+        assert!(screen_text(&mut app).contains("★ Alice"));
+    }
+
+    #[test]
+    fn favorites_sort_first() {
+        let mut app = make_app();
+        add_contact(&mut app, "+1", "Alice");
+        add_contact(&mut app, "+2", "Bob");
+        app.favorites.insert("+2".into());
+        assert_eq!(app.filtered()[0].id, "+2");
     }
 
     #[test]
