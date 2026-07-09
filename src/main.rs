@@ -392,6 +392,19 @@ fn handle_json(app: &mut App, v: &Value) {
     }
 }
 
+/// Messages visible in the chat panel for the current open_id.
+fn chat_messages(app: &App) -> Vec<&Msg> {
+    let id = match app.open_id.as_ref() {
+        Some(id) => id,
+        None => return vec![],
+    };
+    app.messages
+        .iter()
+        .filter(|(cid, _)| cid == id)
+        .map(|(_, m)| m)
+        .collect()
+}
+
 fn border_style(active: bool) -> Style {
     if active {
         Style::default().fg(CYAN)
@@ -458,34 +471,18 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     f.render_stateful_widget(list, cols[0], &mut app.selected);
 
     // --- messages ---
-    // use open_id for chat — stable across re-sorts; fall back to highlighted contact when in List focus
-    let chat_id: Option<String> = app.open_id.clone().or_else(|| {
+    let chat_id: Option<&str> = app.open_id.as_deref().or_else(|| {
         app.selected
             .selected()
-            .and_then(|i| filtered.get(i).map(|(id, _, _)| id.clone()))
+            .and_then(|i| filtered.get(i).map(|(id, _, _)| id.as_str()))
     });
     let chat_title = chat_id
-        .as_ref()
-        .and_then(|id| {
-            filtered
-                .iter()
-                .find(|(fid, _, _)| fid == id)
-                .map(|(_, n, _)| n.clone())
-        })
-        .or_else(|| {
-            chat_id.as_ref().and_then(|id| {
-                app.contacts
-                    .iter()
-                    .find(|c| &c.id == id)
-                    .map(|c| c.name.clone())
-            })
-        })
+        .and_then(|id| filtered.iter().find(|(fid, _, _)| fid == id).map(|(_, n, _)| n.clone()))
         .unwrap_or_default();
-    let lines: Vec<Line> = app
-        .messages
+    let msgs_buf: Vec<&Msg> = chat_messages(app);
+    let lines: Vec<Line> = msgs_buf
         .iter()
-        .filter(|(cid, _)| chat_id.as_ref().map(|id| id == cid).unwrap_or(false))
-        .map(|(_, m)| {
+        .map(|m| {
             let color = if m.from == "me" { BLUE } else { GREEN };
             Line::from(vec![
                 Span::styled(
@@ -553,7 +550,7 @@ mod tests {
     use super::*;
 
     fn make_app() -> App {
-        App {
+        let mut app = App {
             contacts: vec![],
             selected: ListState::default(),
             messages: vec![],
@@ -566,24 +563,235 @@ mod tests {
             pending_g: false,
             open_id: None,
             status: String::new(),
-        }
+        };
+        app.selected.select(Some(0));
+        app
+    }
+
+    fn add_contact(app: &mut App, id: &str, name: &str) {
+        app.contacts.push(Contact { id: id.into(), name: name.into(), is_group: false });
+    }
+
+    fn add_group(app: &mut App, id: &str, name: &str) {
+        app.contacts.push(Contact { id: id.into(), name: name.into(), is_group: true });
+    }
+
+    /// Simulate pressing i/Enter on the currently highlighted contact.
+    fn open_selected(app: &mut App) {
+        app.open_id = app
+            .selected
+            .selected()
+            .and_then(|i| app.filtered().get(i).map(|c| c.id.clone()));
+        app.focus = Focus::Input;
+    }
+
+    // ── send_message ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn send_message_pushes_to_messages() {
+        let mut app = make_app();
+        add_contact(&mut app, "+1", "Alice");
+        open_selected(&mut app);
+        app.input = "hello".into();
+        send_message(&mut app, &mut vec![], 1);
+        assert_eq!(app.messages.len(), 1);
     }
 
     #[test]
-    fn parses_incoming_message() {
+    fn send_message_uses_open_id_as_key() {
+        let mut app = make_app();
+        add_contact(&mut app, "+1", "Alice");
+        open_selected(&mut app);
+        app.input = "hello".into();
+        send_message(&mut app, &mut vec![], 1);
+        assert_eq!(app.messages[0].0, "+1");
+    }
+
+    #[test]
+    fn send_message_clears_input() {
+        let mut app = make_app();
+        add_contact(&mut app, "+1", "Alice");
+        open_selected(&mut app);
+        app.input = "hello".into();
+        send_message(&mut app, &mut vec![], 1);
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn send_message_noop_without_open_id() {
+        let mut app = make_app();
+        add_contact(&mut app, "+1", "Alice");
+        // open_id stays None — never opened a chat
+        app.input = "hello".into();
+        send_message(&mut app, &mut vec![], 1);
+        assert!(app.messages.is_empty(), "send must not fire without open_id");
+    }
+
+    #[test]
+    fn send_message_writes_rpc_to_sink() {
+        let mut app = make_app();
+        add_contact(&mut app, "+1", "Alice");
+        open_selected(&mut app);
+        app.input = "hello".into();
+        let mut sink = vec![];
+        send_message(&mut app, &mut sink, 42);
+        let out = String::from_utf8(sink).unwrap();
+        let v: Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["id"], 42);
+        assert_eq!(v["method"], "send");
+        assert_eq!(v["params"]["recipient"][0], "+1");
+        assert_eq!(v["params"]["message"], "hello");
+    }
+
+    #[test]
+    fn send_message_group_uses_group_rpc() {
+        let mut app = make_app();
+        add_group(&mut app, "grp1", "Team");
+        open_selected(&mut app);
+        app.input = "hi".into();
+        let mut sink = vec![];
+        send_message(&mut app, &mut sink, 1);
+        let v: Value = serde_json::from_str(String::from_utf8(sink).unwrap().trim()).unwrap();
+        assert_eq!(v["params"]["groupId"], "grp1");
+        assert!(v["params"]["recipient"].is_null(), "group send must not include recipient");
+    }
+
+    // ── chat_messages (visibility) ────────────────────────────────────────────
+
+    #[test]
+    fn chat_messages_empty_without_open_id() {
+        let app = make_app();
+        assert!(chat_messages(&app).is_empty());
+    }
+
+    #[test]
+    fn chat_messages_shows_sent_message() {
+        let mut app = make_app();
+        add_contact(&mut app, "+1", "Alice");
+        open_selected(&mut app);
+        app.input = "hello".into();
+        send_message(&mut app, &mut vec![], 1);
+        let visible = chat_messages(&app);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].text, "hello");
+        assert_eq!(visible[0].from, "me");
+    }
+
+    #[test]
+    fn chat_messages_shows_only_current_contact() {
+        let mut app = make_app();
+        add_contact(&mut app, "+1", "Alice");
+        add_contact(&mut app, "+2", "Bob");
+
+        // send to Alice (index 0)
+        open_selected(&mut app);
+        app.input = "to alice".into();
+        send_message(&mut app, &mut vec![], 1);
+
+        // switch to Bob (index 1) and send
+        app.selected.select(Some(1));
+        open_selected(&mut app);
+        app.input = "to bob".into();
+        send_message(&mut app, &mut vec![], 2);
+
+        let visible = chat_messages(&app);
+        assert_eq!(visible.len(), 1, "only bob's message should show");
+        assert_eq!(visible[0].text, "to bob");
+    }
+
+    #[test]
+    fn chat_messages_stable_after_sort_reorder() {
+        let mut app = make_app();
+        add_contact(&mut app, "+1", "Alice");
+        add_contact(&mut app, "+2", "Bob");
+
+        // open Alice (index 0), send
+        open_selected(&mut app);
+        app.input = "hi alice".into();
+        send_message(&mut app, &mut vec![], 1);
+        // Alice is now seq=1, Bob seq=0 → Alice at top (index 0) still
+
+        // simulate incoming from Bob → Bob bumps to seq=2, moves to index 0
+        let v: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"receive","params":{"envelope":{"sourceNumber":"+2","sourceName":"Bob","dataMessage":{"message":"hey"}}}}"#,
+        ).unwrap();
+        handle_json(&mut app, &v);
+        // now filtered = [Bob(2), Alice(1)] — Bob at index 0, Alice at 1
+
+        // open_id is still "+1" (Alice); chat_messages must still show Alice's message
+        assert_eq!(app.open_id.as_deref(), Some("+1"));
+        let visible = chat_messages(&app);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].text, "hi alice");
+    }
+
+    // ── open_id selection ────────────────────────────────────────────────────
+
+    #[test]
+    fn open_selected_sets_open_id() {
+        let mut app = make_app();
+        add_contact(&mut app, "+1", "Alice");
+        open_selected(&mut app);
+        assert_eq!(app.open_id.as_deref(), Some("+1"));
+    }
+
+    #[test]
+    fn open_selected_none_when_no_contacts() {
+        let mut app = make_app();
+        open_selected(&mut app);
+        assert!(app.open_id.is_none());
+    }
+
+    #[test]
+    fn open_selected_picks_correct_index() {
+        let mut app = make_app();
+        add_contact(&mut app, "+1", "Alice");
+        add_contact(&mut app, "+2", "Bob");
+        app.selected.select(Some(1));
+        open_selected(&mut app);
+        assert_eq!(app.open_id.as_deref(), Some("+2"));
+    }
+
+    // ── incoming message parsing ──────────────────────────────────────────────
+
+    #[test]
+    fn parses_incoming_dm() {
         let mut app = make_app();
         let v: Value = serde_json::from_str(
             r#"{"jsonrpc":"2.0","method":"receive","params":{"envelope":{"sourceNumber":"+48123","sourceName":"Bob","dataMessage":{"message":"hi"}}}}"#,
-        )
-        .unwrap();
+        ).unwrap();
         handle_json(&mut app, &v);
         assert_eq!(app.messages.len(), 1);
         assert_eq!(app.messages[0].0, "+48123");
         assert_eq!(app.messages[0].1.text, "hi");
+        assert_eq!(app.messages[0].1.from, "Bob");
     }
 
     #[test]
-    fn disconnected_detected() {
+    fn parses_incoming_group_message() {
+        let mut app = make_app();
+        let v: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"receive","params":{"envelope":{"sourceNumber":"+1","sourceName":"Alice","dataMessage":{"message":"hey","groupInfo":{"groupId":"grp1"}}}}}"#,
+        ).unwrap();
+        handle_json(&mut app, &v);
+        assert_eq!(app.messages[0].0, "grp1");
+    }
+
+    #[test]
+    fn incoming_message_bumps_seq() {
+        let mut app = make_app();
+        add_contact(&mut app, "+1", "Alice");
+        let v: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"receive","params":{"envelope":{"sourceNumber":"+1","sourceName":"Alice","dataMessage":{"message":"hi"}}}}"#,
+        ).unwrap();
+        handle_json(&mut app, &v);
+        assert_eq!(*app.last_msg_seq.get("+1").unwrap(), 1);
+    }
+
+    // ── disconnection ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn disconnected_flag() {
         let mut app = make_app();
         app.connected = false;
         assert!(!app.connected);
