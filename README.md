@@ -49,7 +49,14 @@ cargo build --release
 
 A **Note to Self** chat is added automatically from your linked Signal account, so you can test without messaging other people.
 
-Contact markers: `*` = unread, `★` = favorite. Favorites are stored locally in `~/.config/signal-tui/favorites`.
+Contact markers: `*` = unread, `★` = favorite.
+
+Local files:
+
+- Favorites: `~/.config/signal-tui/favorites`
+- Chat history: `~/.local/share/signal-tui/messages.jsonl`
+
+History is plain text JSONL on disk; delete the file to clear local history.
 
 ## Slash commands
 

@@ -6,9 +6,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -40,6 +41,21 @@ struct Contact {
 }
 
 struct Msg {
+    id: String,
+    from: String,
+    text: String,
+}
+
+struct PendingSend {
+    pending_id: String,
+    contact_id: String,
+    text: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct HistoryRecord {
+    id: String,
+    contact_id: String,
     from: String,
     text: String,
 }
@@ -53,6 +69,9 @@ struct App {
     last_msg_seq: HashMap<String, usize>,
     unread: HashSet<String>,
     favorites: HashSet<String>,
+    seen_msg_ids: HashSet<String>,
+    pending_sends: HashMap<u64, PendingSend>,
+    history_path: Option<PathBuf>,
     msg_seq: usize,
     input: String,
     focus: Focus,
@@ -103,6 +122,19 @@ fn favorites_path() -> Option<PathBuf> {
     Some(config_dir()?.join("favorites"))
 }
 
+fn data_dir() -> Option<PathBuf> {
+    std::env::var_os("SIGNAL_TUI_DATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_DATA_HOME").map(|h| PathBuf::from(h).join("signal-tui")))
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share/signal-tui"))
+        })
+}
+
+fn history_path() -> Option<PathBuf> {
+    Some(data_dir()?.join("messages.jsonl"))
+}
+
 fn read_favorites(path: &Path) -> std::io::Result<HashSet<String>> {
     match fs::read_to_string(path) {
         Ok(s) => Ok(s
@@ -137,6 +169,38 @@ fn save_favorites(app: &mut App) {
     {
         app.status = format!("favorites not saved: {e}");
     }
+}
+
+fn read_history(path: &Path) -> std::io::Result<Vec<HistoryRecord>> {
+    match fs::read_to_string(path) {
+        Ok(s) => Ok(s
+            .lines()
+            .filter_map(|line| serde_json::from_str::<HistoryRecord>(line).ok())
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
+        Err(e) => Err(e),
+    }
+}
+
+fn append_history(path: &Path, record: &HistoryRecord) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(record).map_err(std::io::Error::other)?
+    )
+}
+
+fn msg_id(contact_id: &str, from: &str, ts: i64) -> String {
+    format!("{contact_id}:{from}:{ts}")
+}
+
+fn json_i64(v: &Value) -> Option<i64> {
+    v.as_i64()
+        .or_else(|| v.as_u64().and_then(|n| n.try_into().ok()))
 }
 
 fn parse_linked_account(stdout: &str) -> Option<String> {
@@ -225,6 +289,9 @@ fn main() -> std::io::Result<()> {
         last_msg_seq: HashMap::new(),
         unread: HashSet::new(),
         favorites: load_favorites(),
+        seen_msg_ids: HashSet::new(),
+        pending_sends: HashMap::new(),
+        history_path: history_path(),
         msg_seq: 0,
         input: String::new(),
         focus: Focus::List,
@@ -235,6 +302,7 @@ fn main() -> std::io::Result<()> {
         self_id: account.clone(),
         status: "loading contacts...".into(),
     };
+    load_history(&mut app);
     if let Some(account) = account {
         add_contact_once(&mut app, account, "Note to Self".into(), false);
     }
@@ -433,16 +501,116 @@ fn confirm_search(app: &mut App) {
     }
 }
 
-fn record_message(app: &mut App, cid: String, from: String, text: &str) {
+fn push_message(app: &mut App, cid: String, msg: Msg) {
     app.msg_seq += 1;
     app.last_msg_seq.insert(cid.clone(), app.msg_seq);
-    app.messages.push((
+    app.messages.push((cid, msg));
+}
+
+fn persist_history(app: &mut App, record: &HistoryRecord) {
+    if let Some(path) = &app.history_path
+        && let Err(e) = append_history(path, record)
+    {
+        app.status = format!("history not saved: {e}");
+    }
+}
+
+fn record_message(app: &mut App, cid: String, from: String, text: &str, id: String, persist: bool) {
+    if !app.seen_msg_ids.insert(id.clone()) {
+        return;
+    }
+    push_message(
+        app,
+        cid.clone(),
+        Msg {
+            id: id.clone(),
+            from: from.clone(),
+            text: text.into(),
+        },
+    );
+    if persist {
+        persist_history(
+            app,
+            &HistoryRecord {
+                id,
+                contact_id: cid,
+                from,
+                text: text.into(),
+            },
+        );
+    }
+}
+
+fn record_ephemeral_message(app: &mut App, cid: String, from: String, text: &str, id: String) {
+    push_message(
+        app,
         cid,
         Msg {
+            id,
             from,
             text: text.into(),
         },
-    ));
+    );
+}
+
+fn load_history(app: &mut App) {
+    if let Some(path) = &app.history_path.clone()
+        && let Ok(records) = read_history(path)
+    {
+        for r in records {
+            record_message(app, r.contact_id, r.from, &r.text, r.id, false);
+        }
+    }
+}
+
+fn drop_matching_pending(app: &mut App, cid: &str, text: &str) {
+    if let Some((req_id, pending_id)) = app
+        .pending_sends
+        .iter()
+        .find(|(_, p)| p.contact_id == cid && p.text == text)
+        .map(|(id, p)| (*id, p.pending_id.clone()))
+    {
+        app.pending_sends.remove(&req_id);
+        app.messages.retain(|(_, m)| m.id != pending_id);
+    }
+}
+
+fn confirm_send(app: &mut App, req_id: u64, ts: i64) {
+    let Some(pending) = app.pending_sends.remove(&req_id) else {
+        return;
+    };
+    let id = msg_id(&pending.contact_id, "me", ts);
+    if app.seen_msg_ids.contains(&id) {
+        app.messages.retain(|(_, m)| m.id != pending.pending_id);
+        return;
+    }
+    app.seen_msg_ids.insert(id.clone());
+    if let Some((_, msg)) = app
+        .messages
+        .iter_mut()
+        .find(|(_, m)| m.id == pending.pending_id)
+    {
+        msg.id = id.clone();
+    } else {
+        push_message(
+            app,
+            pending.contact_id.clone(),
+            Msg {
+                id: id.clone(),
+                from: "me".into(),
+                text: pending.text.clone(),
+            },
+        );
+    }
+    persist_history(
+        app,
+        &HistoryRecord {
+            id,
+            contact_id: pending.contact_id,
+            from: "me".into(),
+            text: pending.text,
+        },
+    );
 }
 
 fn handle_command(app: &mut App, command: &str) {
@@ -518,10 +686,25 @@ fn send_message(app: &mut App, child_stdin: &mut impl Write, next_id: u64) {
     };
     rpc(child_stdin, next_id, "send", params);
     let text = std::mem::take(&mut app.input);
-    record_message(app, open_id, "me".into(), &text);
+    let pending_id = format!("pending:{next_id}");
+    record_ephemeral_message(app, open_id.clone(), "me".into(), &text, pending_id.clone());
+    app.pending_sends.insert(
+        next_id,
+        PendingSend {
+            pending_id,
+            contact_id: open_id,
+            text,
+        },
+    );
 }
 
 fn handle_json(app: &mut App, v: &Value) {
+    if let Some(req_id) = v.get("id").and_then(|id| id.as_u64())
+        && let Some(ts) = v.pointer("/result/timestamp").and_then(json_i64)
+    {
+        confirm_send(app, req_id, ts);
+    }
+
     // contact/group list responses
     if let Some(result) = v.get("result").and_then(|r| r.as_array()) {
         for item in result {
@@ -567,7 +750,16 @@ fn handle_json(app: &mut App, v: &Value) {
                 .or(env["sourceNumber"].as_str())
                 .unwrap_or("?")
                 .to_string();
-            record_message(app, cid.clone(), from.clone(), text);
+            let from_id = env["sourceNumber"].as_str().unwrap_or(&from);
+            let id = json_i64(&dm["timestamp"])
+                .or_else(|| json_i64(&env["timestamp"]))
+                .map(|ts| msg_id(&cid, from_id, ts));
+            if let Some(id) = id {
+                record_message(app, cid.clone(), from.clone(), text, id, true);
+            } else {
+                let id = format!("local:{}", app.msg_seq + 1);
+                record_ephemeral_message(app, cid.clone(), from.clone(), text, id);
+            }
             if app.open_id.as_deref() != Some(cid.as_str()) {
                 app.unread.insert(cid);
             }
@@ -586,7 +778,14 @@ fn handle_json(app: &mut App, v: &Value) {
                 .or(app.self_id.as_deref())
                 .unwrap_or("?")
                 .to_string();
-            record_message(app, cid, "me".into(), text);
+            if let Some(ts) = json_i64(&sm["timestamp"]) {
+                drop_matching_pending(app, &cid, text);
+                let id = msg_id(&cid, "me", ts);
+                record_message(app, cid, "me".into(), text, id, true);
+            } else {
+                let id = format!("local:{}", app.msg_seq + 1);
+                record_ephemeral_message(app, cid, "me".into(), text, id);
+            }
         }
     }
     if let Some(err) = v.get("error") {
@@ -787,6 +986,9 @@ mod tests {
             last_msg_seq: HashMap::new(),
             unread: HashSet::new(),
             favorites: HashSet::new(),
+            seen_msg_ids: HashSet::new(),
+            pending_sends: HashMap::new(),
+            history_path: None,
             msg_seq: 0,
             input: String::new(),
             focus: Focus::List,
@@ -825,13 +1027,40 @@ mod tests {
         );
     }
 
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "signal-tui-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
     #[test]
     fn favorites_file_roundtrip() {
-        let path =
-            std::env::temp_dir().join(format!("signal-tui-favorites-{}", std::process::id()));
+        let path = temp_path("favorites");
         let favorites = HashSet::from(["+2".to_string(), "+1".to_string()]);
         write_favorites(&path, &favorites).unwrap();
         assert_eq!(read_favorites(&path).unwrap(), favorites);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn history_file_roundtrip() {
+        let path = temp_path("history");
+        let record = HistoryRecord {
+            id: msg_id("+1", "me", 123),
+            contact_id: "+1".into(),
+            from: "me".into(),
+            text: "hi".into(),
+        };
+        append_history(&path, &record).unwrap();
+        let records = read_history(&path).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, record.id);
+        assert_eq!(records[0].text, "hi");
         let _ = fs::remove_file(path);
     }
 
@@ -898,6 +1127,25 @@ mod tests {
         assert_eq!(v["method"], "send");
         assert_eq!(v["params"]["recipient"][0], "+1");
         assert_eq!(v["params"]["message"], "hello");
+    }
+
+    #[test]
+    fn send_response_persists_pending_message() {
+        let path = temp_path("send-history");
+        let mut app = make_app();
+        app.history_path = Some(path.clone());
+        add_contact(&mut app, "+1", "Alice");
+        open_selected(&mut app);
+        app.input = "hello".into();
+        send_message(&mut app, &mut vec![], 42);
+        handle_json(
+            &mut app,
+            &json!({"jsonrpc":"2.0","id":42,"result":{"timestamp":123}}),
+        );
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].1.id, msg_id("+1", "me", 123));
+        assert_eq!(read_history(&path).unwrap().len(), 1);
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -1171,6 +1419,53 @@ mod tests {
         assert!(app.unread.contains("+2"));
         open_chat(&mut app, "+2".into());
         assert!(!app.unread.contains("+2"));
+    }
+
+    #[test]
+    fn incoming_with_same_timestamp_is_deduped() {
+        let mut app = make_app();
+        let v: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"receive","params":{"envelope":{"sourceNumber":"+2","sourceName":"Bob","dataMessage":{"timestamp":123,"message":"hi"}}}}"#,
+        ).unwrap();
+        handle_json(&mut app, &v);
+        handle_json(&mut app, &v);
+        assert_eq!(app.messages.len(), 1);
+    }
+
+    #[test]
+    fn sync_after_send_response_is_deduped() {
+        let mut app = make_app();
+        add_contact(&mut app, "+1", "Alice");
+        open_selected(&mut app);
+        app.input = "hello".into();
+        send_message(&mut app, &mut vec![], 42);
+        handle_json(
+            &mut app,
+            &json!({"jsonrpc":"2.0","id":42,"result":{"timestamp":123}}),
+        );
+        let sync: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"receive","params":{"envelope":{"syncMessage":{"sentMessage":{"destinationNumber":"+1","timestamp":123,"message":"hello"}}}}}"#,
+        ).unwrap();
+        handle_json(&mut app, &sync);
+        assert_eq!(app.messages.len(), 1);
+    }
+
+    #[test]
+    fn sync_before_send_response_is_deduped() {
+        let mut app = make_app();
+        add_contact(&mut app, "+1", "Alice");
+        open_selected(&mut app);
+        app.input = "hello".into();
+        send_message(&mut app, &mut vec![], 42);
+        let sync: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"receive","params":{"envelope":{"syncMessage":{"sentMessage":{"destinationNumber":"+1","timestamp":123,"message":"hello"}}}}}"#,
+        ).unwrap();
+        handle_json(&mut app, &sync);
+        handle_json(
+            &mut app,
+            &json!({"jsonrpc":"2.0","id":42,"result":{"timestamp":123}}),
+        );
+        assert_eq!(app.messages.len(), 1);
     }
 
     #[test]
