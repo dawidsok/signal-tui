@@ -57,6 +57,7 @@ struct App {
     pending_g: bool,
     // open chat contact id — decoupled from list sort index
     open_id: Option<String>,
+    self_id: Option<String>,
     status: String,
 }
 
@@ -68,7 +69,7 @@ impl App {
         } else {
             self.contacts
                 .iter()
-                .filter(|c| c.name.to_lowercase().contains(&q))
+                .filter(|c| c.name.to_lowercase().contains(&q) || c.id.to_lowercase().contains(&q))
                 .collect()
         };
         // sort by most recently messaged; contacts never messaged go to bottom
@@ -86,13 +87,21 @@ fn rpc(stdin: &mut impl Write, id: u64, method: &str, params: Value) {
     let _ = writeln!(stdin, "{}", req);
 }
 
-/// Returns true if signal-cli has at least one linked/registered account.
-fn is_linked() -> bool {
+fn parse_linked_account(stdout: &str) -> Option<String> {
+    serde_json::from_str::<Value>(stdout)
+        .ok()?
+        .as_array()?
+        .iter()
+        .find_map(|a| a.get("number").and_then(|n| n.as_str()).map(str::to_string))
+}
+
+/// Returns the first linked/registered signal-cli account, if any.
+fn linked_account() -> Option<String> {
     Command::new("signal-cli")
-        .args(["listAccounts"])
+        .args(["--output=json", "listAccounts"])
         .output()
-        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
-        .unwrap_or(false)
+        .ok()
+        .and_then(|o| parse_linked_account(&String::from_utf8_lossy(&o.stdout)))
 }
 
 /// Run signal-cli link in foreground, printing the QR code to the terminal.
@@ -115,12 +124,19 @@ fn run_link() -> std::io::Result<()> {
 }
 
 fn main() -> std::io::Result<()> {
-    if !is_linked() {
+    let mut account = linked_account();
+    if account.is_none() {
         run_link()?;
+        account = linked_account();
     }
 
-    let mut child: Child = Command::new("signal-cli")
-        .args(["--output=json", "jsonRpc"])
+    let mut command = Command::new("signal-cli");
+    command.arg("--output=json");
+    if let Some(account) = &account {
+        command.args(["-a", account]);
+    }
+    let mut child: Child = command
+        .arg("jsonRpc")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -137,10 +153,10 @@ fn main() -> std::io::Result<()> {
     let (tx, rx) = mpsc::channel::<Value>();
     std::thread::spawn(move || {
         for line in BufReader::new(child_stdout).lines().map_while(Result::ok) {
-            if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                if tx.send(v).is_err() {
-                    break;
-                }
+            if let Ok(v) = serde_json::from_str::<Value>(&line)
+                && tx.send(v).is_err()
+            {
+                break;
             }
         }
         // thread exits → channel closes → main loop detects disconnect
@@ -162,8 +178,12 @@ fn main() -> std::io::Result<()> {
         connected: true,
         pending_g: false,
         open_id: None,
+        self_id: account.clone(),
         status: "loading contacts...".into(),
     };
+    if let Some(account) = account {
+        add_contact_once(&mut app, account, "Note to Self".into(), false);
+    }
     app.selected.select(Some(0));
 
     let res = run(&mut terminal, &mut app, &rx, &mut child_stdin);
@@ -214,7 +234,7 @@ fn run(
                         app.search.pop();
                         clamp_selected(app);
                     }
-                    KeyCode::Enter => app.focus = Focus::List,
+                    KeyCode::Enter => confirm_search(app),
                     KeyCode::Char(ch) => {
                         app.search.push(ch);
                         app.selected.select(Some(0));
@@ -227,8 +247,9 @@ fn run(
                     }
                     KeyCode::Esc => app.focus = Focus::List,
                     KeyCode::Enter if !app.input.is_empty() => {
-                        send_message(app, child_stdin, next_id);
-                        next_id += 1;
+                        if submit_input(app, child_stdin, next_id) {
+                            next_id += 1;
+                        }
                     }
                     KeyCode::Backspace => {
                         app.input.pop();
@@ -249,11 +270,7 @@ fn run(
                             false
                         }
                         KeyCode::Char('i') | KeyCode::Enter => {
-                            app.open_id = app
-                                .selected
-                                .selected()
-                                .and_then(|i| app.filtered().get(i).map(|c| c.id.clone()));
-                            app.focus = Focus::Input;
+                            open_selected_contact(app);
                             false
                         }
                         KeyCode::Char('j') | KeyCode::Down => {
@@ -291,6 +308,86 @@ fn clamp_selected(app: &mut App) {
     app.selected.select(Some(i));
 }
 
+fn add_contact_once(app: &mut App, id: String, name: String, is_group: bool) {
+    if !app.contacts.iter().any(|c| c.id == id) {
+        app.contacts.push(Contact { id, name, is_group });
+    }
+}
+
+fn open_selected_contact(app: &mut App) {
+    app.open_id = app
+        .selected
+        .selected()
+        .and_then(|i| app.filtered().get(i).map(|c| c.id.clone()));
+    app.focus = Focus::Input;
+}
+
+fn confirm_search(app: &mut App) {
+    let q = app.search.trim().to_string();
+    if app.filtered().is_empty() && !q.is_empty() {
+        app.search = q.clone();
+        add_contact_once(app, q.clone(), q.clone(), false);
+        app.open_id = Some(q.clone());
+        app.status = format!("new chat: {q}");
+        app.focus = Focus::Input;
+        app.selected.select(Some(0));
+    } else {
+        app.focus = Focus::List;
+        clamp_selected(app);
+    }
+}
+
+fn record_message(app: &mut App, cid: String, from: String, text: &str) {
+    app.msg_seq += 1;
+    app.last_msg_seq.insert(cid.clone(), app.msg_seq);
+    app.messages.push((
+        cid,
+        Msg {
+            from,
+            text: text.into(),
+        },
+    ));
+}
+
+fn handle_command(app: &mut App, command: &str) {
+    let mut parts = command.split_whitespace();
+    match parts.next().unwrap_or("") {
+        "/help" => app.status = "commands: /chat <number>, /self".into(),
+        "/chat" | "/new" => match parts.next() {
+            Some(id) => {
+                add_contact_once(app, id.into(), id.into(), false);
+                app.open_id = Some(id.into());
+                app.search.clear();
+                app.focus = Focus::Input;
+                app.status = format!("chat: {id}");
+            }
+            None => app.status = "usage: /chat <number>".into(),
+        },
+        "/self" | "/me" => match app.self_id.clone() {
+            Some(id) => {
+                add_contact_once(app, id.clone(), "Note to Self".into(), false);
+                app.open_id = Some(id);
+                app.search.clear();
+                app.focus = Focus::Input;
+                app.status = "chat: Note to Self".into();
+            }
+            None => app.status = "no linked account for /self".into(),
+        },
+        other => app.status = format!("unknown command: {other}"),
+    }
+}
+
+fn submit_input(app: &mut App, child_stdin: &mut impl Write, next_id: u64) -> bool {
+    if app.input.trim_start().starts_with('/') {
+        let command = std::mem::take(&mut app.input);
+        handle_command(app, command.trim());
+        false
+    } else {
+        send_message(app, child_stdin, next_id);
+        true
+    }
+}
+
 fn send_message(app: &mut App, child_stdin: &mut impl Write, next_id: u64) {
     // fall back to highlighted contact if no chat was explicitly opened
     if app.open_id.is_none() {
@@ -309,22 +406,16 @@ fn send_message(app: &mut App, child_stdin: &mut impl Write, next_id: u64) {
         .find(|c| c.id == open_id)
         .map(|c| c.is_group)
         .unwrap_or(false);
-    let params = if is_group {
+    let params = if app.self_id.as_deref() == Some(open_id.as_str()) {
+        json!({"noteToSelf": true, "message": app.input})
+    } else if is_group {
         json!({"groupId": open_id, "message": app.input})
     } else {
         json!({"recipient": [open_id], "message": app.input})
     };
     rpc(child_stdin, next_id, "send", params);
-    app.msg_seq += 1;
-    app.last_msg_seq.insert(open_id.clone(), app.msg_seq);
-    app.messages.push((
-        open_id,
-        Msg {
-            from: "me".into(),
-            text: app.input.clone(),
-        },
-    ));
-    app.input.clear();
+    let text = std::mem::take(&mut app.input);
+    record_message(app, open_id, "me".into(), &text);
 }
 
 fn handle_json(app: &mut App, v: &Value) {
@@ -333,15 +424,12 @@ fn handle_json(app: &mut App, v: &Value) {
         for item in result {
             if item.get("members").is_some() {
                 if let Some(gid) = item.get("id").and_then(|x| x.as_str()) {
-                    app.contacts.push(Contact {
-                        id: gid.into(),
-                        name: item
-                            .get("name")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or(gid)
-                            .into(),
-                        is_group: true,
-                    });
+                    let name = item
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or(gid)
+                        .into();
+                    add_contact_once(app, gid.into(), name, true);
                 }
                 continue;
             }
@@ -353,18 +441,17 @@ fn handle_json(app: &mut App, v: &Value) {
                     .or_else(|| item.get("name").and_then(|x| x.as_str()))
                     .filter(|s| !s.is_empty())
                     .unwrap_or(number);
-                app.contacts.push(Contact {
-                    id: number.into(),
-                    name: name.into(),
-                    is_group: false,
-                });
+                add_contact_once(app, number.into(), name.into(), false);
             }
         }
         app.status = format!("{} contacts", app.contacts.len());
     }
     // incoming message notification
     if v.get("method").and_then(|m| m.as_str()) == Some("receive") {
-        let env = &v["params"]["envelope"];
+        let env = v
+            .pointer("/params/envelope")
+            .or_else(|| v.pointer("/params/result/envelope"))
+            .unwrap_or(&Value::Null);
         let from = env["sourceName"]
             .as_str()
             .or(env["sourceNumber"].as_str())
@@ -377,21 +464,23 @@ fn handle_json(app: &mut App, v: &Value) {
                 .or(env["sourceNumber"].as_str())
                 .unwrap_or("?")
                 .to_string();
-            app.msg_seq += 1;
-            let seq = app.msg_seq;
-            app.last_msg_seq.insert(cid.clone(), seq);
-            app.messages.push((
-                cid.clone(),
-                Msg {
-                    from: from.clone(),
-                    text: text.into(),
-                },
-            ));
+            record_message(app, cid, from.clone(), text);
             let _ = Notification::new()
                 .summary(&format!("Signal: {}", from))
                 .body(text)
                 .appname("signal-tui")
                 .show();
+        }
+        let sm = &env["syncMessage"]["sentMessage"];
+        if let Some(text) = sm["message"].as_str() {
+            let cid = sm["groupInfo"]["groupId"]
+                .as_str()
+                .or(sm["destinationNumber"].as_str())
+                .or(sm["destination"].as_str())
+                .or(app.self_id.as_deref())
+                .unwrap_or("?")
+                .to_string();
+            record_message(app, cid, "me".into(), text);
         }
     }
     if let Some(err) = v.get("error") {
@@ -489,7 +578,12 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
             .and_then(|i| filtered.get(i).map(|(id, _, _)| id.as_str()))
     });
     let chat_title = chat_id
-        .and_then(|id| filtered.iter().find(|(fid, _, _)| fid == id).map(|(_, n, _)| n.clone()))
+        .and_then(|id| {
+            filtered
+                .iter()
+                .find(|(fid, _, _)| fid == id)
+                .map(|(_, n, _)| n.clone())
+        })
         .unwrap_or_default();
     let msgs_buf: Vec<&Msg> = chat_messages(app, &filtered);
     let lines: Vec<Line> = msgs_buf
@@ -505,9 +599,13 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
             ])
         })
         .collect();
+    let msg_scroll = lines
+        .len()
+        .saturating_sub(right[0].height.saturating_sub(2) as usize)
+        .min(u16::MAX as usize) as u16;
     let msgs = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
-        .scroll((u16::MAX, 0))
+        .scroll((msg_scroll, 0))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -541,8 +639,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     };
     let mode_hint = match app.focus {
         Focus::List => "j/k navigate · / search · i/Enter compose · q quit",
-        Focus::Search => "type to filter · Enter confirm · Esc cancel",
-        Focus::Input => "Enter send · Esc back",
+        Focus::Search => "type to filter/new chat · Enter confirm · Esc cancel",
+        Focus::Input => "Enter send · /help commands · Esc back",
     };
     let status_line = Line::from(vec![
         Span::styled(format!(" {} ", conn_sym), Style::default().fg(conn_color)),
@@ -574,6 +672,7 @@ mod tests {
             connected: true,
             pending_g: false,
             open_id: None,
+            self_id: None,
             status: String::new(),
         };
         app.selected.select(Some(0));
@@ -581,11 +680,27 @@ mod tests {
     }
 
     fn add_contact(app: &mut App, id: &str, name: &str) {
-        app.contacts.push(Contact { id: id.into(), name: name.into(), is_group: false });
+        app.contacts.push(Contact {
+            id: id.into(),
+            name: name.into(),
+            is_group: false,
+        });
     }
 
     fn add_group(app: &mut App, id: &str, name: &str) {
-        app.contacts.push(Contact { id: id.into(), name: name.into(), is_group: true });
+        app.contacts.push(Contact {
+            id: id.into(),
+            name: name.into(),
+            is_group: true,
+        });
+    }
+
+    #[test]
+    fn parse_linked_account_reads_json_number() {
+        assert_eq!(
+            parse_linked_account(r#"[{"number":"+123"}]"#).as_deref(),
+            Some("+123")
+        );
     }
 
     /// Simulate pressing i/Enter on the currently highlighted contact.
@@ -635,7 +750,10 @@ mod tests {
         // no contacts loaded, open_id None — nothing to fall back to
         app.input = "hello".into();
         send_message(&mut app, &mut vec![], 1);
-        assert!(app.messages.is_empty(), "send must not fire with no contacts");
+        assert!(
+            app.messages.is_empty(),
+            "send must not fire with no contacts"
+        );
     }
 
     #[test]
@@ -664,7 +782,45 @@ mod tests {
         send_message(&mut app, &mut sink, 1);
         let v: Value = serde_json::from_str(String::from_utf8(sink).unwrap().trim()).unwrap();
         assert_eq!(v["params"]["groupId"], "grp1");
-        assert!(v["params"]["recipient"].is_null(), "group send must not include recipient");
+        assert!(
+            v["params"]["recipient"].is_null(),
+            "group send must not include recipient"
+        );
+    }
+
+    #[test]
+    fn send_message_self_uses_note_to_self_rpc() {
+        let mut app = make_app();
+        app.self_id = Some("+1".into());
+        add_contact(&mut app, "+1", "Note to Self");
+        open_selected(&mut app);
+        app.input = "test".into();
+        let mut sink = vec![];
+        send_message(&mut app, &mut sink, 1);
+        let v: Value = serde_json::from_str(String::from_utf8(sink).unwrap().trim()).unwrap();
+        assert_eq!(v["params"]["noteToSelf"], true);
+        assert!(v["params"]["recipient"].is_null());
+    }
+
+    #[test]
+    fn slash_chat_opens_new_chat_without_sending() {
+        let mut app = make_app();
+        app.input = "/chat +2".into();
+        let mut sink = vec![];
+        assert!(!submit_input(&mut app, &mut sink, 1));
+        assert!(sink.is_empty());
+        assert_eq!(app.open_id.as_deref(), Some("+2"));
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn slash_self_opens_note_to_self() {
+        let mut app = make_app();
+        app.self_id = Some("+1".into());
+        app.input = "/self".into();
+        assert!(!submit_input(&mut app, &mut vec![], 1));
+        assert_eq!(app.open_id.as_deref(), Some("+1"));
+        assert!(app.contacts.iter().any(|c| c.name == "Note to Self"));
     }
 
     // ── chat_messages (visibility) ────────────────────────────────────────────
@@ -676,6 +832,42 @@ mod tests {
             .map(|c| (c.id.clone(), c.name.clone(), c.is_group))
             .collect();
         chat_messages(app, &filtered)
+    }
+
+    fn screen_text(app: &mut App) -> String {
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn draw_renders_sent_message_text() {
+        let mut app = make_app();
+        add_contact(&mut app, "+1", "Alice");
+        open_selected(&mut app);
+        app.input = "hello".into();
+        send_message(&mut app, &mut vec![], 1);
+        assert!(screen_text(&mut app).contains("hello"));
+    }
+
+    #[test]
+    fn confirm_search_starts_chat_when_no_contact_matches() {
+        let mut app = make_app();
+        add_contact(&mut app, "+1", "Alice");
+        app.focus = Focus::Search;
+        app.search = "+2".into();
+        confirm_search(&mut app);
+        assert_eq!(app.open_id.as_deref(), Some("+2"));
+        assert!(app.focus == Focus::Input);
+        assert!(app.contacts.iter().any(|c| c.id == "+2"));
     }
 
     #[test]
@@ -808,6 +1000,19 @@ mod tests {
         ).unwrap();
         handle_json(&mut app, &v);
         assert_eq!(app.messages[0].0, "grp1");
+    }
+
+    #[test]
+    fn parses_sync_sent_message() {
+        let mut app = make_app();
+        app.self_id = Some("+1".into());
+        let v: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"receive","params":{"envelope":{"syncMessage":{"sentMessage":{"destinationNumber":"+1","message":"note"}}}}}"#,
+        ).unwrap();
+        handle_json(&mut app, &v);
+        assert_eq!(app.messages[0].0, "+1");
+        assert_eq!(app.messages[0].1.from, "me");
+        assert_eq!(app.messages[0].1.text, "note");
     }
 
     #[test]

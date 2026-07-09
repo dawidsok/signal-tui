@@ -40,6 +40,21 @@ cargo build --release
 |-----|--------|
 | Tab | Switch focus (contacts ↔ input) |
 | Up / Down | Navigate contacts (contacts focus) |
-| Enter | Send message |
+| / | Search contacts; type a new number and Enter to start a chat |
+| i / Enter | Open selected chat |
+| Enter | Send message (input focus) |
 | q | Quit (contacts focus) |
 | Ctrl-C | Quit (any focus) |
+
+A **Note to Self** chat is added automatically from your linked Signal account, so you can test without messaging other people.
+
+## Slash commands
+
+Type these in the message input:
+
+| Command | Action |
+|---------|--------|
+| `/help` | Show available commands in the status line |
+| `/chat <number>` | Open/start a chat with a phone number |
+| `/new <number>` | Alias for `/chat` |
+| `/self` or `/me` | Open Note to Self |
