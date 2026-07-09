@@ -3,7 +3,7 @@ use notify_rust::Notification;
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 use serde_json::{json, Value};
@@ -12,6 +12,24 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
+
+// dim-sum theme palette
+const BG: Color = Color::Rgb(0x11, 0x11, 0x10);
+const BG3: Color = Color::Rgb(0x31, 0x30, 0x2c);
+const DIM: Color = Color::Rgb(0x57, 0x56, 0x51);
+const FG: Color = Color::Rgb(0xce, 0xcb, 0xc1);
+const CYAN: Color = Color::Rgb(0x5f, 0x9b, 0x95);
+const GREEN: Color = Color::Rgb(0x87, 0x96, 0x5f);
+const RED: Color = Color::Rgb(0xa8, 0x5f, 0x59);
+const YELLOW: Color = Color::Rgb(0xb3, 0x95, 0x4d);
+const BLUE: Color = Color::Rgb(0x6f, 0x8f, 0xaf);
+
+#[derive(PartialEq, Clone, Copy)]
+enum Focus {
+    List,
+    Search,
+    Input,
+}
 
 struct Contact {
     id: String, // phone number or groupId
@@ -33,9 +51,11 @@ struct App {
     last_msg_seq: HashMap<String, usize>,
     msg_seq: usize,
     input: String,
-    focus_input: bool,
+    focus: Focus,
     search: String,
-    searching: bool,
+    connected: bool,
+    // pending 'g' for 'gg' binding
+    pending_g: bool,
     status: String,
 }
 
@@ -67,10 +87,7 @@ fn is_linked() -> bool {
     Command::new("signal-cli")
         .args(["listAccounts"])
         .output()
-        .map(|o| {
-            // listAccounts prints one account per line; empty → not linked
-            !String::from_utf8_lossy(&o.stdout).trim().is_empty()
-        })
+        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
         .unwrap_or(false)
 }
 
@@ -122,6 +139,7 @@ fn main() -> std::io::Result<()> {
                 }
             }
         }
+        // thread exits → channel closes → main loop detects disconnect
     });
 
     rpc(&mut child_stdin, 1, "listContacts", json!({}));
@@ -135,9 +153,10 @@ fn main() -> std::io::Result<()> {
         last_msg_seq: HashMap::new(),
         msg_seq: 0,
         input: String::new(),
-        focus_input: true,
+        focus: Focus::List,
         search: String::new(),
-        searching: false,
+        connected: true,
+        pending_g: false,
         status: "loading contacts...".into(),
     };
     app.selected.select(Some(0));
@@ -156,8 +175,15 @@ fn run(
 ) -> std::io::Result<()> {
     let mut next_id: u64 = 100;
     loop {
-        while let Ok(v) = rx.try_recv() {
-            handle_json(app, &v);
+        loop {
+            match rx.try_recv() {
+                Ok(v) => handle_json(app, &v),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    app.connected = false;
+                    break;
+                }
+            }
         }
 
         terminal.draw(|f| draw(f, app))?;
@@ -169,74 +195,112 @@ fn run(
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            match key.code {
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Ok(())
-                }
-                KeyCode::Esc if app.searching => {
-                    app.search.clear();
-                    app.searching = false;
-                    let max = app.filtered().len().saturating_sub(1);
-                    let i = app.selected.selected().unwrap_or(0).min(max);
-                    app.selected.select(Some(i));
-                }
-                KeyCode::Backspace if app.searching => {
-                    app.search.pop();
-                    let max = app.filtered().len().saturating_sub(1);
-                    let i = app.selected.selected().unwrap_or(0).min(max);
-                    app.selected.select(Some(i));
-                }
-                KeyCode::Char(ch) if app.searching => {
-                    app.search.push(ch);
-                    app.selected.select(Some(0));
-                }
-                KeyCode::Char('/') if !app.focus_input && !app.searching => {
-                    app.searching = true;
-                    app.search.clear();
-                    app.selected.select(Some(0));
-                }
-                KeyCode::Tab => {
-                    app.focus_input = !app.focus_input;
-                    app.searching = false;
-                }
-                KeyCode::Up if !app.focus_input => {
-                    let i = app.selected.selected().unwrap_or(0);
-                    app.selected.select(Some(i.saturating_sub(1)));
-                }
-                KeyCode::Down if !app.focus_input => {
-                    let i = app.selected.selected().unwrap_or(0);
-                    let max = app.filtered().len().saturating_sub(1);
-                    app.selected.select(Some((i + 1).min(max)));
-                }
-                KeyCode::Enter if app.focus_input && !app.input.is_empty() => {
-                    let contact_id = app
-                        .selected
-                        .selected()
-                        .and_then(|i| app.filtered().get(i).map(|c| (c.id.clone(), c.is_group)));
-                    if let Some((id, is_group)) = contact_id {
-                        let params = if is_group {
-                            json!({"groupId": id, "message": app.input})
-                        } else {
-                            json!({"recipient": [id], "message": app.input})
-                        };
-                        rpc(child_stdin, next_id, "send", params);
-                        next_id += 1;
-                        app.msg_seq += 1;
-                        app.last_msg_seq.insert(id.clone(), app.msg_seq);
-                        app.messages.push((
-                            id,
-                            Msg { from: "me".into(), text: app.input.clone() },
-                        ));
-                        app.input.clear();
+            match app.focus {
+                Focus::Search => match key.code {
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(())
                     }
+                    KeyCode::Esc => {
+                        app.search.clear();
+                        app.focus = Focus::List;
+                        clamp_selected(app);
+                    }
+                    KeyCode::Backspace => {
+                        app.search.pop();
+                        clamp_selected(app);
+                    }
+                    KeyCode::Enter => app.focus = Focus::List,
+                    KeyCode::Char(ch) => {
+                        app.search.push(ch);
+                        app.selected.select(Some(0));
+                    }
+                    _ => {}
+                },
+                Focus::Input => match key.code {
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(())
+                    }
+                    KeyCode::Esc => app.focus = Focus::List,
+                    KeyCode::Enter if !app.input.is_empty() => {
+                        send_message(app, child_stdin, next_id);
+                        next_id += 1;
+                    }
+                    KeyCode::Backspace => {
+                        app.input.pop();
+                    }
+                    KeyCode::Char(ch) => app.input.push(ch),
+                    _ => {}
+                },
+                Focus::List => {
+                    app.pending_g = match key.code {
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            return Ok(())
+                        }
+                        KeyCode::Char('q') => return Ok(()),
+                        KeyCode::Char('/') => {
+                            app.focus = Focus::Search;
+                            app.search.clear();
+                            app.selected.select(Some(0));
+                            false
+                        }
+                        KeyCode::Char('i') | KeyCode::Enter => {
+                            app.focus = Focus::Input;
+                            false
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            let i = app.selected.selected().unwrap_or(0);
+                            let max = app.filtered().len().saturating_sub(1);
+                            app.selected.select(Some((i + 1).min(max)));
+                            false
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            let i = app.selected.selected().unwrap_or(0);
+                            app.selected.select(Some(i.saturating_sub(1)));
+                            false
+                        }
+                        KeyCode::Char('g') if app.pending_g => {
+                            app.selected.select(Some(0));
+                            false
+                        }
+                        KeyCode::Char('g') => true, // wait for second g
+                        KeyCode::Char('G') => {
+                            let max = app.filtered().len().saturating_sub(1);
+                            app.selected.select(Some(max));
+                            false
+                        }
+                        _ => false,
+                    };
                 }
-                KeyCode::Backspace if app.focus_input => {
-                    app.input.pop();
-                }
-                KeyCode::Char('q') if !app.focus_input => return Ok(()),
-                KeyCode::Char(ch) if app.focus_input => app.input.push(ch),
-                _ => {}
             }
+        }
+    }
+}
+
+fn clamp_selected(app: &mut App) {
+    let max = app.filtered().len().saturating_sub(1);
+    let i = app.selected.selected().unwrap_or(0).min(max);
+    app.selected.select(Some(i));
+}
+
+fn send_message(app: &mut App, child_stdin: &mut impl Write, next_id: u64) {
+    let contact = app
+        .selected
+        .selected()
+        .and_then(|i| app.filtered().get(i).map(|c| (c.id.clone(), c.is_group)));
+    if let Some((id, is_group)) = contact {
+        let params = if is_group {
+            json!({"groupId": id, "message": app.input})
+        } else {
+            json!({"recipient": [id], "message": app.input})
+        };
+        rpc(child_stdin, next_id, "send", params);
+        app.msg_seq += 1;
+        app.last_msg_seq.insert(id.clone(), app.msg_seq);
+        app.messages.push((id.clone(), Msg { from: "me".into(), text: app.input.clone() }));
+        app.input.clear();
+        // re-select after sort order may have changed
+        if let Some(new_idx) = app.filtered().iter().position(|c| c.id == id) {
+            app.selected.select(Some(new_idx));
         }
     }
 }
@@ -294,7 +358,17 @@ fn handle_json(app: &mut App, v: &Value) {
             app.msg_seq += 1;
             let seq = app.msg_seq;
             app.last_msg_seq.insert(cid.clone(), seq);
-            app.messages.push((cid, Msg { from: from.clone(), text: text.into() }));
+            app.messages.push((cid.clone(), Msg { from: from.clone(), text: text.into() }));
+            // keep selected contact stable after re-sort
+            let current_id = app
+                .selected
+                .selected()
+                .and_then(|i| app.filtered().get(i).map(|c| c.id.clone()));
+            if let Some(cur) = current_id {
+                if let Some(new_idx) = app.filtered().iter().position(|c| c.id == cur) {
+                    app.selected.select(Some(new_idx));
+                }
+            }
             let _ = Notification::new()
                 .summary(&format!("Signal: {}", from))
                 .body(text)
@@ -307,77 +381,122 @@ fn handle_json(app: &mut App, v: &Value) {
     }
 }
 
+fn border_style(active: bool) -> Style {
+    if active {
+        Style::default().fg(CYAN)
+    } else {
+        Style::default().fg(BG3)
+    }
+}
+
 fn draw(f: &mut ratatui::Frame, app: &mut App) {
+    // fill background
+    f.render_widget(Block::default().style(Style::default().bg(BG)), f.area());
+
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(28), Constraint::Min(1)])
         .split(f.area());
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Min(1), Constraint::Length(3), Constraint::Length(1)])
         .split(cols[1]);
 
+    // --- contacts list ---
     // ponytail: collect to break borrow before render_stateful_widget needs &mut app.selected
     let filtered: Vec<(String, String, bool)> = app
         .filtered()
         .into_iter()
         .map(|c| (c.id.clone(), c.name.clone(), c.is_group))
         .collect();
+
     let items: Vec<ListItem> = filtered
         .iter()
         .map(|(_, name, is_group)| {
-            ListItem::new(if *is_group {
-                format!("# {}", name)
-            } else {
-                name.clone()
-            })
+            let label = if *is_group { format!("# {}", name) } else { name.clone() };
+            ListItem::new(label).style(Style::default().fg(FG))
         })
         .collect();
-    let list_title = if app.searching {
+
+    let list_title = if app.focus == Focus::Search {
         format!("/ {}_", app.search)
-    } else if app.focus_input {
-        "Contacts (Tab)".into()
     } else {
-        "Contacts * (/ search)".into()
+        "Contacts".into()
     };
+    let list_active = matches!(app.focus, Focus::List | Focus::Search);
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(list_title))
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style(list_active))
+                .title(Span::styled(list_title, Style::default().fg(if list_active { CYAN } else { DIM })))
+                .style(Style::default().bg(BG)),
+        )
+        .highlight_style(
+            Style::default().bg(BG3).fg(FG).add_modifier(Modifier::BOLD),
+        );
     f.render_stateful_widget(list, cols[0], &mut app.selected);
 
+    // --- messages ---
     let current = app.selected.selected().and_then(|i| filtered.get(i).cloned());
     let lines: Vec<Line> = app
         .messages
         .iter()
         .filter(|(cid, _)| current.as_ref().map(|(id, _, _)| id == cid).unwrap_or(false))
-        .map(|(_, m)| Line::from(format!("{}: {}", m.from, m.text)))
+        .map(|(_, m)| {
+            let color = if m.from == "me" { BLUE } else { GREEN };
+            Line::from(vec![
+                Span::styled(format!("{}: ", m.from), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Span::styled(m.text.clone(), Style::default().fg(FG)),
+            ])
+        })
         .collect();
-    let title = current.as_ref().map(|(_, name, _)| name.clone()).unwrap_or_default();
+    let chat_title = current.as_ref().map(|(_, name, _)| name.clone()).unwrap_or_default();
     let msgs = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((u16::MAX, 0))
-        .block(Block::default().borders(Borders::ALL).title(title));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style(false))
+                .title(Span::styled(chat_title, Style::default().fg(DIM)))
+                .style(Style::default().bg(BG)),
+        );
     f.render_widget(msgs, right[0]);
 
-    let input = Paragraph::new(app.input.as_str()).block(
-        Block::default().borders(Borders::ALL).title(if app.focus_input {
-            "Message *"
-        } else {
-            "Message (Tab)"
-        }),
-    );
+    // --- input ---
+    let input_active = app.focus == Focus::Input;
+    let input = Paragraph::new(app.input.as_str())
+        .style(Style::default().fg(FG))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style(input_active))
+                .title(Span::styled("Message", Style::default().fg(if input_active { CYAN } else { DIM })))
+                .style(Style::default().bg(BG)),
+        );
     f.render_widget(input, right[1]);
 
+    // --- statusline ---
+    let (conn_sym, conn_color) = if app.connected {
+        ("● connected", GREEN)
+    } else {
+        ("✗ disconnected", RED)
+    };
+    let mode_hint = match app.focus {
+        Focus::List => "j/k navigate · / search · i/Enter compose · q quit",
+        Focus::Search => "type to filter · Enter confirm · Esc cancel",
+        Focus::Input => "Enter send · Esc back",
+    };
+    let status_line = Line::from(vec![
+        Span::styled(format!(" {} ", conn_sym), Style::default().fg(conn_color)),
+        Span::styled("│ ", Style::default().fg(BG3)),
+        Span::styled(format!("{} ", app.status), Style::default().fg(DIM)),
+        Span::styled("│ ", Style::default().fg(BG3)),
+        Span::styled(mode_hint, Style::default().fg(DIM)),
+    ]);
     f.render_widget(
-        Paragraph::new(format!(
-            " {} | Tab: switch focus | Enter: send | q (list focus)/Ctrl-C: quit",
-            app.status
-        ))
-        .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(status_line).style(Style::default().bg(BG)),
         right[2],
     );
 }
@@ -386,20 +505,25 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_incoming_message() {
-        let mut app = App {
+    fn make_app() -> App {
+        App {
             contacts: vec![],
             selected: ListState::default(),
             messages: vec![],
             last_msg_seq: HashMap::new(),
             msg_seq: 0,
             input: String::new(),
-            focus_input: true,
+            focus: Focus::List,
             search: String::new(),
-            searching: false,
+            connected: true,
+            pending_g: false,
             status: String::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn parses_incoming_message() {
+        let mut app = make_app();
         let v: Value = serde_json::from_str(
             r#"{"jsonrpc":"2.0","method":"receive","params":{"envelope":{"sourceNumber":"+48123","sourceName":"Bob","dataMessage":{"message":"hi"}}}}"#,
         )
@@ -408,5 +532,12 @@ mod tests {
         assert_eq!(app.messages.len(), 1);
         assert_eq!(app.messages[0].0, "+48123");
         assert_eq!(app.messages[0].1.text, "hi");
+    }
+
+    #[test]
+    fn disconnected_detected() {
+        let mut app = make_app();
+        app.connected = false;
+        assert!(!app.connected);
     }
 }
