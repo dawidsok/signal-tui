@@ -6,7 +6,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
@@ -21,7 +21,6 @@ const FG: Color = Color::Rgb(0xce, 0xcb, 0xc1);
 const CYAN: Color = Color::Rgb(0x5f, 0x9b, 0x95);
 const GREEN: Color = Color::Rgb(0x87, 0x96, 0x5f);
 const RED: Color = Color::Rgb(0xa8, 0x5f, 0x59);
-const YELLOW: Color = Color::Rgb(0xb3, 0x95, 0x4d);
 const BLUE: Color = Color::Rgb(0x6f, 0x8f, 0xaf);
 
 #[derive(PartialEq, Clone, Copy)]
@@ -67,7 +66,10 @@ impl App {
         let mut contacts: Vec<&Contact> = if q.is_empty() {
             self.contacts.iter().collect()
         } else {
-            self.contacts.iter().filter(|c| c.name.to_lowercase().contains(&q)).collect()
+            self.contacts
+                .iter()
+                .filter(|c| c.name.to_lowercase().contains(&q))
+                .collect()
         };
         // sort by most recently messaged; contacts never messaged go to bottom
         contacts.sort_by(|a, b| {
@@ -201,7 +203,7 @@ fn run(
             match app.focus {
                 Focus::Search => match key.code {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(())
+                        return Ok(());
                     }
                     KeyCode::Esc => {
                         app.search.clear();
@@ -221,7 +223,7 @@ fn run(
                 },
                 Focus::Input => match key.code {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(())
+                        return Ok(());
                     }
                     KeyCode::Esc => app.focus = Focus::List,
                     KeyCode::Enter if !app.input.is_empty() => {
@@ -237,7 +239,7 @@ fn run(
                 Focus::List => {
                     app.pending_g = match key.code {
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            return Ok(())
+                            return Ok(());
                         }
                         KeyCode::Char('q') => return Ok(()),
                         KeyCode::Char('/') => {
@@ -294,7 +296,12 @@ fn send_message(app: &mut App, child_stdin: &mut impl Write, next_id: u64) {
         Some(id) => id,
         None => return,
     };
-    let is_group = app.contacts.iter().find(|c| c.id == open_id).map(|c| c.is_group).unwrap_or(false);
+    let is_group = app
+        .contacts
+        .iter()
+        .find(|c| c.id == open_id)
+        .map(|c| c.is_group)
+        .unwrap_or(false);
     let params = if is_group {
         json!({"groupId": open_id, "message": app.input})
     } else {
@@ -303,7 +310,13 @@ fn send_message(app: &mut App, child_stdin: &mut impl Write, next_id: u64) {
     rpc(child_stdin, next_id, "send", params);
     app.msg_seq += 1;
     app.last_msg_seq.insert(open_id.clone(), app.msg_seq);
-    app.messages.push((open_id, Msg { from: "me".into(), text: app.input.clone() }));
+    app.messages.push((
+        open_id,
+        Msg {
+            from: "me".into(),
+            text: app.input.clone(),
+        },
+    ));
     app.input.clear();
 }
 
@@ -360,7 +373,13 @@ fn handle_json(app: &mut App, v: &Value) {
             app.msg_seq += 1;
             let seq = app.msg_seq;
             app.last_msg_seq.insert(cid.clone(), seq);
-            app.messages.push((cid.clone(), Msg { from: from.clone(), text: text.into() }));
+            app.messages.push((
+                cid.clone(),
+                Msg {
+                    from: from.clone(),
+                    text: text.into(),
+                },
+            ));
             let _ = Notification::new()
                 .summary(&format!("Signal: {}", from))
                 .body(text)
@@ -391,7 +410,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         .split(f.area());
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(3), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
         .split(cols[1]);
 
     // --- contacts list ---
@@ -405,7 +428,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     let items: Vec<ListItem> = filtered
         .iter()
         .map(|(_, name, is_group)| {
-            let label = if *is_group { format!("# {}", name) } else { name.clone() };
+            let label = if *is_group {
+                format!("# {}", name)
+            } else {
+                name.clone()
+            };
             ListItem::new(label).style(Style::default().fg(FG))
         })
         .collect();
@@ -421,23 +448,38 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style(list_active))
-                .title(Span::styled(list_title, Style::default().fg(if list_active { CYAN } else { DIM })))
+                .title(Span::styled(
+                    list_title,
+                    Style::default().fg(if list_active { CYAN } else { DIM }),
+                ))
                 .style(Style::default().bg(BG)),
         )
-        .highlight_style(
-            Style::default().bg(BG3).fg(FG).add_modifier(Modifier::BOLD),
-        );
+        .highlight_style(Style::default().bg(BG3).fg(FG).add_modifier(Modifier::BOLD));
     f.render_stateful_widget(list, cols[0], &mut app.selected);
 
     // --- messages ---
     // use open_id for chat — stable across re-sorts; fall back to highlighted contact when in List focus
     let chat_id: Option<String> = app.open_id.clone().or_else(|| {
-        app.selected.selected().and_then(|i| filtered.get(i).map(|(id, _, _)| id.clone()))
+        app.selected
+            .selected()
+            .and_then(|i| filtered.get(i).map(|(id, _, _)| id.clone()))
     });
     let chat_title = chat_id
         .as_ref()
-        .and_then(|id| filtered.iter().find(|(fid, _, _)| fid == id).map(|(_, n, _)| n.clone()))
-        .or_else(|| chat_id.as_ref().and_then(|id| app.contacts.iter().find(|c| &c.id == id).map(|c| c.name.clone())))
+        .and_then(|id| {
+            filtered
+                .iter()
+                .find(|(fid, _, _)| fid == id)
+                .map(|(_, n, _)| n.clone())
+        })
+        .or_else(|| {
+            chat_id.as_ref().and_then(|id| {
+                app.contacts
+                    .iter()
+                    .find(|c| &c.id == id)
+                    .map(|c| c.name.clone())
+            })
+        })
         .unwrap_or_default();
     let lines: Vec<Line> = app
         .messages
@@ -446,7 +488,10 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         .map(|(_, m)| {
             let color = if m.from == "me" { BLUE } else { GREEN };
             Line::from(vec![
-                Span::styled(format!("{}: ", m.from), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("{}: ", m.from),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(m.text.clone(), Style::default().fg(FG)),
             ])
         })
@@ -471,7 +516,10 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style(input_active))
-                .title(Span::styled("Message", Style::default().fg(if input_active { CYAN } else { DIM })))
+                .title(Span::styled(
+                    "Message",
+                    Style::default().fg(if input_active { CYAN } else { DIM }),
+                ))
                 .style(Style::default().bg(BG)),
         );
     f.render_widget(input, right[1]);
