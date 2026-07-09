@@ -34,6 +34,28 @@ cargo build --release
 
 `signal-cli` must be on `$PATH` (`brew install signal-cli`).
 
+## Background receiver
+
+Run the receiver without opening the TUI:
+
+```sh
+signal-tui daemon
+```
+
+In another terminal, open/close the TUI whenever you want:
+
+```sh
+signal-tui
+```
+
+If the daemon is running, the TUI reads local history/unread state and does not start a second receiver. If no daemon is running, the TUI receives messages itself like before.
+
+Check daemon state:
+
+```sh
+signal-tui status
+```
+
 ## Keys
 
 | Key | Action |
@@ -55,6 +77,9 @@ Local files:
 
 - Favorites: `~/.config/signal-tui/favorites`
 - Chat history: `~/.local/share/signal-tui/messages.jsonl`
+- Unread chats: `~/.local/share/signal-tui/unread`
+- Receiver status: `~/.local/share/signal-tui/status.json`
+- Receiver lock: `~/.local/share/signal-tui/receiver.lock`
 
 History is plain text JSONL on disk; delete the file to clear local history.
 

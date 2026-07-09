@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // dim-sum theme palette
 const BG: Color = Color::Rgb(0x11, 0x11, 0x10);
@@ -107,7 +107,7 @@ impl App {
     }
 }
 
-fn rpc(stdin: &mut impl Write, id: u64, method: &str, params: Value) {
+fn rpc(stdin: &mut (impl Write + ?Sized), id: u64, method: &str, params: Value) {
     let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
     let _ = writeln!(stdin, "{}", req);
 }
@@ -133,6 +133,18 @@ fn data_dir() -> Option<PathBuf> {
 
 fn history_path() -> Option<PathBuf> {
     Some(data_dir()?.join("messages.jsonl"))
+}
+
+fn unread_path() -> Option<PathBuf> {
+    Some(data_dir()?.join("unread"))
+}
+
+fn status_path() -> Option<PathBuf> {
+    Some(data_dir()?.join("status.json"))
+}
+
+fn receiver_lock_path() -> Option<PathBuf> {
+    Some(data_dir()?.join("receiver.lock"))
 }
 
 fn read_favorites(path: &Path) -> std::io::Result<HashSet<String>> {
@@ -161,6 +173,45 @@ fn load_favorites() -> HashSet<String> {
     favorites_path()
         .and_then(|p| read_favorites(&p).ok())
         .unwrap_or_default()
+}
+
+fn read_set(path: &Path) -> std::io::Result<HashSet<String>> {
+    match fs::read_to_string(path) {
+        Ok(s) => Ok(s
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashSet::new()),
+        Err(e) => Err(e),
+    }
+}
+
+fn write_set(path: &Path, set: &HashSet<String>) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut lines: Vec<&str> = set.iter().map(String::as_str).collect();
+    lines.sort_unstable();
+    fs::write(path, lines.join("\n"))
+}
+
+fn load_unread() -> HashSet<String> {
+    unread_path()
+        .and_then(|p| read_set(&p).ok())
+        .unwrap_or_default()
+}
+
+fn save_unread(app: &mut App) {
+    if app.history_path.is_none() {
+        return;
+    }
+    if let Some(path) = unread_path()
+        && let Err(e) = write_set(&path, &app.unread)
+    {
+        app.status = format!("unread not saved: {e}");
+    }
 }
 
 fn save_favorites(app: &mut App) {
@@ -203,6 +254,88 @@ fn json_i64(v: &Value) -> Option<i64> {
         .or_else(|| v.as_u64().and_then(|n| n.try_into().ok()))
 }
 
+#[derive(Deserialize, Serialize)]
+struct DaemonStatus {
+    pid: u32,
+    role: String,
+    state: String,
+    updated_at_ms: u128,
+    last_error: Option<String>,
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn write_status(state: &str, error: Option<String>) {
+    let Some(path) = status_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let status = DaemonStatus {
+        pid: std::process::id(),
+        role: "receiver".into(),
+        state: state.into(),
+        updated_at_ms: now_ms(),
+        last_error: error,
+    };
+    if let Ok(s) = serde_json::to_string_pretty(&status) {
+        let _ = fs::write(path, s);
+    }
+}
+
+fn pid_is_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+struct ReceiverLock {
+    path: PathBuf,
+}
+
+impl Drop for ReceiverLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_receiver_lock() -> std::io::Result<Option<ReceiverLock>> {
+    let Some(path) = receiver_lock_path() else {
+        return Ok(None);
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    for _ in 0..2 {
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                writeln!(file, "{}", std::process::id())?;
+                return Ok(Some(ReceiverLock { path }));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let live = fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .is_some_and(pid_is_alive);
+                if live {
+                    return Ok(None);
+                }
+                let _ = fs::remove_file(&path);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(None)
+}
+
 fn parse_linked_account(stdout: &str) -> Option<String> {
     serde_json::from_str::<Value>(stdout)
         .ok()?
@@ -239,55 +372,22 @@ fn run_link() -> std::io::Result<()> {
     }
 }
 
-fn main() -> std::io::Result<()> {
+fn ensure_account() -> std::io::Result<Option<String>> {
     let mut account = linked_account();
     if account.is_none() {
         run_link()?;
         account = linked_account();
     }
+    Ok(account)
+}
 
-    let mut command = Command::new("signal-cli");
-    command.arg("--output=json");
-    if let Some(account) = &account {
-        command.args(["-a", account]);
-    }
-    let mut child: Child = command
-        .arg("jsonRpc")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| {
-            std::io::Error::other(format!(
-                "failed to start signal-cli ({e}); install: brew install signal-cli, then link/register account"
-            ))
-        })?;
-
-    let mut child_stdin = child.stdin.take().unwrap();
-    let child_stdout = child.stdout.take().unwrap();
-
-    let (tx, rx) = mpsc::channel::<Value>();
-    std::thread::spawn(move || {
-        for line in BufReader::new(child_stdout).lines().map_while(Result::ok) {
-            if let Ok(v) = serde_json::from_str::<Value>(&line)
-                && tx.send(v).is_err()
-            {
-                break;
-            }
-        }
-        // thread exits → channel closes → main loop detects disconnect
-    });
-
-    rpc(&mut child_stdin, 1, "listContacts", json!({}));
-    rpc(&mut child_stdin, 2, "listGroups", json!({}));
-
-    let mut terminal = ratatui::init();
+fn new_app(account: Option<String>, status: String) -> App {
     let mut app = App {
         contacts: vec![],
         selected: ListState::default(),
         messages: vec![],
         last_msg_seq: HashMap::new(),
-        unread: HashSet::new(),
+        unread: load_unread(),
         favorites: load_favorites(),
         seen_msg_ids: HashSet::new(),
         pending_sends: HashMap::new(),
@@ -300,29 +400,159 @@ fn main() -> std::io::Result<()> {
         pending_g: false,
         open_id: None,
         self_id: account.clone(),
-        status: "loading contacts...".into(),
+        status,
     };
     load_history(&mut app);
+    for id in app
+        .messages
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>()
+    {
+        add_contact_once(&mut app, id.clone(), id, false);
+    }
     if let Some(account) = account {
         add_contact_once(&mut app, account, "Note to Self".into(), false);
     }
     app.selected.select(Some(0));
+    app
+}
 
-    let res = run(&mut terminal, &mut app, &rx, &mut child_stdin);
+fn spawn_signal_jsonrpc(account: Option<&str>) -> std::io::Result<Child> {
+    let mut command = Command::new("signal-cli");
+    command.arg("--output=json");
+    if let Some(account) = account {
+        command.args(["-a", account]);
+    }
+    command
+        .arg("jsonRpc")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            std::io::Error::other(format!(
+                "failed to start signal-cli ({e}); install: brew install signal-cli, then link/register account"
+            ))
+        })
+}
+
+fn spawn_reader(child_stdout: impl std::io::Read + Send + 'static) -> mpsc::Receiver<Value> {
+    let (tx, rx) = mpsc::channel::<Value>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(child_stdout).lines().map_while(Result::ok) {
+            if let Ok(v) = serde_json::from_str::<Value>(&line)
+                && tx.send(v).is_err()
+            {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+fn main() -> std::io::Result<()> {
+    match std::env::args().nth(1).as_deref() {
+        Some("daemon") => run_daemon(),
+        Some("status") => print_status(),
+        Some(other) => Err(std::io::Error::other(format!("unknown command: {other}"))),
+        None => run_tui(),
+    }
+}
+
+fn run_tui() -> std::io::Result<()> {
+    let account = ensure_account()?;
+    let receiver_lock = acquire_receiver_lock()?;
+    let mut child = None;
+    let mut rx = None;
+    let mut child_stdin = None;
+    let status = if receiver_lock.is_some() {
+        let mut c = spawn_signal_jsonrpc(account.as_deref())?;
+        child_stdin = c.stdin.take();
+        rx = c.stdout.take().map(spawn_reader);
+        child = Some(c);
+        "loading contacts...".into()
+    } else {
+        "background receiver active".into()
+    };
+
+    if let Some(stdin) = child_stdin.as_mut() {
+        rpc(stdin, 1, "listContacts", json!({}));
+        rpc(stdin, 2, "listGroups", json!({}));
+    }
+
+    let mut terminal = ratatui::init();
+    let mut app = new_app(account, status);
+    let res = run(
+        &mut terminal,
+        &mut app,
+        rx.as_ref(),
+        child_stdin.as_mut().map(|s| s as &mut dyn Write),
+    );
     ratatui::restore();
-    let _ = child.kill();
+    drop(receiver_lock);
+    if let Some(mut child) = child {
+        let _ = child.kill();
+    }
     res
+}
+
+fn print_status() -> std::io::Result<()> {
+    if let Some(path) = status_path()
+        && let Ok(s) = fs::read_to_string(path)
+    {
+        println!("{s}");
+        return Ok(());
+    }
+    println!("no background receiver status");
+    Ok(())
+}
+
+fn run_daemon() -> std::io::Result<()> {
+    let account = ensure_account()?;
+    let Some(_lock) = acquire_receiver_lock()? else {
+        println!("receiver already running");
+        return Ok(());
+    };
+    write_status("starting", None);
+    let mut app = new_app(account.clone(), "daemon".into());
+    let mut child = spawn_signal_jsonrpc(account.as_deref())?;
+    let stdout = child.stdout.take().unwrap();
+    write_status("connected", None);
+    for line in BufReader::new(stdout).lines() {
+        match line {
+            Ok(line) => match serde_json::from_str::<Value>(&line) {
+                Ok(v) => {
+                    handle_json(&mut app, &v);
+                    write_status("connected", None);
+                }
+                Err(e) => write_status("parse-error", Some(e.to_string())),
+            },
+            Err(e) => {
+                write_status("disconnected", Some(e.to_string()));
+                break;
+            }
+        }
+    }
+    let _ = child.kill();
+    Ok(())
 }
 
 fn run(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
-    rx: &mpsc::Receiver<Value>,
-    child_stdin: &mut impl Write,
+    rx: Option<&mpsc::Receiver<Value>>,
+    mut child_stdin: Option<&mut dyn Write>,
 ) -> std::io::Result<()> {
     let mut next_id: u64 = 100;
+    let mut last_reload = Instant::now();
     loop {
-        drain_incoming(app, rx, MAX_EVENTS_PER_TICK);
+        if let Some(rx) = rx {
+            drain_incoming(app, rx, MAX_EVENTS_PER_TICK);
+        } else if last_reload.elapsed() >= Duration::from_secs(1) {
+            reload_local_state(app);
+            last_reload = Instant::now();
+        }
 
         terminal.draw(|f| draw(f, app))?;
 
@@ -360,7 +590,12 @@ fn run(
                     }
                     KeyCode::Esc => app.focus = Focus::List,
                     KeyCode::Enter if !app.input.is_empty() => {
-                        if submit_input(app, child_stdin, next_id) {
+                        let sent = if let Some(stdin) = child_stdin.as_deref_mut() {
+                            submit_input(app, stdin, next_id)
+                        } else {
+                            submit_input_local(app)
+                        };
+                        if sent {
                             next_id += 1;
                         }
                     }
@@ -452,8 +687,16 @@ fn current_chat_id(app: &App) -> Option<String> {
     })
 }
 
+fn sync_unread_from_disk(app: &mut App) {
+    if app.history_path.is_some() {
+        app.unread = load_unread();
+    }
+}
+
 fn open_chat(app: &mut App, id: String) {
+    sync_unread_from_disk(app);
     app.unread.remove(&id);
+    save_unread(app);
     app.open_id = Some(id);
     app.focus = Focus::Input;
 }
@@ -515,9 +758,16 @@ fn persist_history(app: &mut App, record: &HistoryRecord) {
     }
 }
 
-fn record_message(app: &mut App, cid: String, from: String, text: &str, id: String, persist: bool) {
+fn record_message(
+    app: &mut App,
+    cid: String,
+    from: String,
+    text: &str,
+    id: String,
+    persist: bool,
+) -> bool {
     if !app.seen_msg_ids.insert(id.clone()) {
-        return;
+        return false;
     }
     push_message(
         app,
@@ -539,6 +789,7 @@ fn record_message(app: &mut App, cid: String, from: String, text: &str, id: Stri
             },
         );
     }
+    true
 }
 
 fn record_ephemeral_message(app: &mut App, cid: String, from: String, text: &str, id: String) {
@@ -561,6 +812,11 @@ fn load_history(app: &mut App) {
             record_message(app, r.contact_id, r.from, &r.text, r.id, false);
         }
     }
+}
+
+fn reload_local_state(app: &mut App) {
+    load_history(app);
+    app.unread = load_unread();
 }
 
 fn drop_matching_pending(app: &mut App, cid: &str, text: &str) {
@@ -647,7 +903,7 @@ fn handle_command(app: &mut App, command: &str) {
     }
 }
 
-fn submit_input(app: &mut App, child_stdin: &mut impl Write, next_id: u64) -> bool {
+fn submit_input(app: &mut App, child_stdin: &mut (impl Write + ?Sized), next_id: u64) -> bool {
     if app.input.trim_start().starts_with('/') {
         let command = std::mem::take(&mut app.input);
         handle_command(app, command.trim());
@@ -658,15 +914,85 @@ fn submit_input(app: &mut App, child_stdin: &mut impl Write, next_id: u64) -> bo
     }
 }
 
-fn send_message(app: &mut App, child_stdin: &mut impl Write, next_id: u64) {
-    // fall back to highlighted contact if no chat was explicitly opened
+fn submit_input_local(app: &mut App) -> bool {
+    if app.input.trim_start().starts_with('/') {
+        let command = std::mem::take(&mut app.input);
+        handle_command(app, command.trim());
+        false
+    } else {
+        send_message_oneshot(app);
+        true
+    }
+}
+
+fn open_id_or_selected(app: &mut App) -> Option<String> {
     if app.open_id.is_none() {
         app.open_id = app
             .selected
             .selected()
             .and_then(|i| app.filtered().get(i).map(|c| c.id.clone()));
     }
-    let open_id = match app.open_id.clone() {
+    app.open_id.clone()
+}
+
+fn send_message_oneshot(app: &mut App) {
+    let Some(open_id) = open_id_or_selected(app) else {
+        return;
+    };
+    let text = std::mem::take(&mut app.input);
+    let is_group = app
+        .contacts
+        .iter()
+        .find(|c| c.id == open_id)
+        .map(|c| c.is_group)
+        .unwrap_or(false);
+    let mut command = Command::new("signal-cli");
+    command.arg("--output=json");
+    if let Some(account) = &app.self_id {
+        command.args(["-a", account]);
+    }
+    command.arg("send");
+    if app.self_id.as_deref() == Some(open_id.as_str()) {
+        command.arg("--note-to-self");
+    } else if is_group {
+        command.args(["--group-id", &open_id]);
+    } else {
+        command.arg(&open_id);
+    }
+    command.args(["--message", &text]);
+    match command.output() {
+        Ok(o) if o.status.success() => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let ts = serde_json::from_str::<Value>(&stdout)
+                .ok()
+                .and_then(|v| find_timestamp(&v));
+            if let Some(ts) = ts {
+                let id = msg_id(&open_id, "me", ts);
+                record_message(app, open_id, "me".into(), &text, id, true);
+            } else {
+                let id = format!("local:{}", app.msg_seq + 1);
+                record_ephemeral_message(app, open_id, "me".into(), &text, id);
+            }
+        }
+        Ok(o) => {
+            app.input = text;
+            app.status = format!("send failed: {}", String::from_utf8_lossy(&o.stderr).trim());
+        }
+        Err(e) => {
+            app.input = text;
+            app.status = format!("send failed: {e}");
+        }
+    }
+}
+
+fn find_timestamp(v: &Value) -> Option<i64> {
+    json_i64(&v["timestamp"])
+        .or_else(|| json_i64(&v["result"]["timestamp"]))
+        .or_else(|| v.as_array()?.iter().find_map(find_timestamp))
+}
+
+fn send_message(app: &mut App, child_stdin: &mut (impl Write + ?Sized), next_id: u64) {
+    let open_id = match open_id_or_selected(app) {
         Some(id) => id,
         None => return,
     };
@@ -754,20 +1080,25 @@ fn handle_json(app: &mut App, v: &Value) {
             let id = json_i64(&dm["timestamp"])
                 .or_else(|| json_i64(&env["timestamp"]))
                 .map(|ts| msg_id(&cid, from_id, ts));
-            if let Some(id) = id {
-                record_message(app, cid.clone(), from.clone(), text, id, true);
+            let is_new = if let Some(id) = id {
+                record_message(app, cid.clone(), from.clone(), text, id, true)
             } else {
                 let id = format!("local:{}", app.msg_seq + 1);
                 record_ephemeral_message(app, cid.clone(), from.clone(), text, id);
+                true
+            };
+            if is_new {
+                if app.open_id.as_deref() != Some(cid.as_str()) {
+                    sync_unread_from_disk(app);
+                    app.unread.insert(cid.clone());
+                    save_unread(app);
+                }
+                let _ = Notification::new()
+                    .summary(&format!("Signal: {}", from))
+                    .body(text)
+                    .appname("signal-tui")
+                    .show();
             }
-            if app.open_id.as_deref() != Some(cid.as_str()) {
-                app.unread.insert(cid);
-            }
-            let _ = Notification::new()
-                .summary(&format!("Signal: {}", from))
-                .body(text)
-                .appname("signal-tui")
-                .show();
         }
         let sm = &env["syncMessage"]["sentMessage"];
         if let Some(text) = sm["message"].as_str() {
@@ -957,7 +1288,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         ("✗ disconnected", RED)
     };
     let mode_hint = match app.focus {
-        Focus::List => "j/k navigate · / search · i/Enter compose · q quit",
+        Focus::List => "j/k navigate · / search · f favorite · i/Enter compose · q quit",
         Focus::Search => "type to filter/new chat · Enter confirm · Esc cancel",
         Focus::Input => "Enter send · /help commands · Esc back",
     };
@@ -1062,6 +1393,29 @@ mod tests {
         assert_eq!(records[0].id, record.id);
         assert_eq!(records[0].text, "hi");
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn unread_file_roundtrip() {
+        let path = temp_path("unread");
+        let unread = HashSet::from(["+2".to_string(), "grp".to_string()]);
+        write_set(&path, &unread).unwrap();
+        assert_eq!(read_set(&path).unwrap(), unread);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn finds_timestamp_in_send_output() {
+        assert_eq!(find_timestamp(&json!({"timestamp": 123})), Some(123));
+        assert_eq!(
+            find_timestamp(&json!({"result": {"timestamp": 456}})),
+            Some(456)
+        );
+    }
+
+    #[test]
+    fn current_pid_is_alive() {
+        assert!(pid_is_alive(std::process::id()));
     }
 
     /// Simulate pressing i/Enter on the currently highlighted contact.
