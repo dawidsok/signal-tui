@@ -292,6 +292,13 @@ fn clamp_selected(app: &mut App) {
 }
 
 fn send_message(app: &mut App, child_stdin: &mut impl Write, next_id: u64) {
+    // fall back to highlighted contact if no chat was explicitly opened
+    if app.open_id.is_none() {
+        app.open_id = app
+            .selected
+            .selected()
+            .and_then(|i| app.filtered().get(i).map(|c| c.id.clone()));
+    }
     let open_id = match app.open_id.clone() {
         Some(id) => id,
         None => return,
@@ -392,17 +399,22 @@ fn handle_json(app: &mut App, v: &Value) {
     }
 }
 
-/// Messages visible in the chat panel for the current open_id.
-fn chat_messages(app: &App) -> Vec<&Msg> {
-    let id = match app.open_id.as_ref() {
-        Some(id) => id,
-        None => return vec![],
-    };
-    app.messages
-        .iter()
-        .filter(|(cid, _)| cid == id)
-        .map(|(_, m)| m)
-        .collect()
+/// Messages visible in the chat panel — uses open_id, falls back to highlighted contact.
+fn chat_messages<'a>(app: &'a App, filtered: &[(String, String, bool)]) -> Vec<&'a Msg> {
+    let id: Option<&str> = app.open_id.as_deref().or_else(|| {
+        app.selected
+            .selected()
+            .and_then(|i| filtered.get(i).map(|(id, _, _)| id.as_str()))
+    });
+    match id {
+        None => vec![],
+        Some(id) => app
+            .messages
+            .iter()
+            .filter(|(cid, _)| cid.as_str() == id)
+            .map(|(_, m)| m)
+            .collect(),
+    }
 }
 
 fn border_style(active: bool) -> Style {
@@ -479,7 +491,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     let chat_title = chat_id
         .and_then(|id| filtered.iter().find(|(fid, _, _)| fid == id).map(|(_, n, _)| n.clone()))
         .unwrap_or_default();
-    let msgs_buf: Vec<&Msg> = chat_messages(app);
+    let msgs_buf: Vec<&Msg> = chat_messages(app, &filtered);
     let lines: Vec<Line> = msgs_buf
         .iter()
         .map(|m| {
@@ -618,13 +630,12 @@ mod tests {
     }
 
     #[test]
-    fn send_message_noop_without_open_id() {
+    fn send_message_noop_when_no_contacts_at_all() {
         let mut app = make_app();
-        add_contact(&mut app, "+1", "Alice");
-        // open_id stays None — never opened a chat
+        // no contacts loaded, open_id None — nothing to fall back to
         app.input = "hello".into();
         send_message(&mut app, &mut vec![], 1);
-        assert!(app.messages.is_empty(), "send must not fire without open_id");
+        assert!(app.messages.is_empty(), "send must not fire with no contacts");
     }
 
     #[test]
@@ -658,10 +669,19 @@ mod tests {
 
     // ── chat_messages (visibility) ────────────────────────────────────────────
 
+    fn visible<'a>(app: &'a App) -> Vec<&'a Msg> {
+        let filtered: Vec<(String, String, bool)> = app
+            .filtered()
+            .into_iter()
+            .map(|c| (c.id.clone(), c.name.clone(), c.is_group))
+            .collect();
+        chat_messages(app, &filtered)
+    }
+
     #[test]
     fn chat_messages_empty_without_open_id() {
         let app = make_app();
-        assert!(chat_messages(&app).is_empty());
+        assert!(visible(&app).is_empty());
     }
 
     #[test]
@@ -671,10 +691,10 @@ mod tests {
         open_selected(&mut app);
         app.input = "hello".into();
         send_message(&mut app, &mut vec![], 1);
-        let visible = chat_messages(&app);
-        assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].text, "hello");
-        assert_eq!(visible[0].from, "me");
+        let v = visible(&app);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].text, "hello");
+        assert_eq!(v[0].from, "me");
     }
 
     #[test]
@@ -694,9 +714,9 @@ mod tests {
         app.input = "to bob".into();
         send_message(&mut app, &mut vec![], 2);
 
-        let visible = chat_messages(&app);
-        assert_eq!(visible.len(), 1, "only bob's message should show");
-        assert_eq!(visible[0].text, "to bob");
+        let v = visible(&app);
+        assert_eq!(v.len(), 1, "only bob's message should show");
+        assert_eq!(v[0].text, "to bob");
     }
 
     #[test]
@@ -709,20 +729,33 @@ mod tests {
         open_selected(&mut app);
         app.input = "hi alice".into();
         send_message(&mut app, &mut vec![], 1);
-        // Alice is now seq=1, Bob seq=0 → Alice at top (index 0) still
 
         // simulate incoming from Bob → Bob bumps to seq=2, moves to index 0
         let v: Value = serde_json::from_str(
             r#"{"jsonrpc":"2.0","method":"receive","params":{"envelope":{"sourceNumber":"+2","sourceName":"Bob","dataMessage":{"message":"hey"}}}}"#,
         ).unwrap();
         handle_json(&mut app, &v);
-        // now filtered = [Bob(2), Alice(1)] — Bob at index 0, Alice at 1
+        // now filtered = [Bob(2), Alice(1)]
 
-        // open_id is still "+1" (Alice); chat_messages must still show Alice's message
+        // open_id is still "+1" (Alice); messages must still show Alice's message
         assert_eq!(app.open_id.as_deref(), Some("+1"));
-        let visible = chat_messages(&app);
-        assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].text, "hi alice");
+        let v = visible(&app);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].text, "hi alice");
+    }
+
+    #[test]
+    fn send_without_explicit_open_uses_highlighted_contact() {
+        let mut app = make_app();
+        add_contact(&mut app, "+1", "Alice");
+        // never called open_selected — open_id stays None
+        app.focus = Focus::Input;
+        app.input = "hi".into();
+        send_message(&mut app, &mut vec![], 1);
+        // open_id should have been set from highlighted contact
+        assert_eq!(app.open_id.as_deref(), Some("+1"));
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].1.text, "hi");
     }
 
     // ── open_id selection ────────────────────────────────────────────────────
