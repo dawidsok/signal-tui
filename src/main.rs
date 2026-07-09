@@ -37,7 +37,42 @@ fn rpc(stdin: &mut impl Write, id: u64, method: &str, params: Value) {
     let _ = writeln!(stdin, "{}", req);
 }
 
+/// Returns true if signal-cli has at least one linked/registered account.
+fn is_linked() -> bool {
+    Command::new("signal-cli")
+        .args(["listAccounts"])
+        .output()
+        .map(|o| {
+            // listAccounts prints one account per line; empty → not linked
+            !String::from_utf8_lossy(&o.stdout).trim().is_empty()
+        })
+        .unwrap_or(false)
+}
+
+/// Run signal-cli link in foreground, printing the QR code to the terminal.
+/// Blocks until the user scans and the link is confirmed (process exits).
+fn run_link() -> std::io::Result<()> {
+    println!("No Signal account linked. Starting device linking...\n");
+    println!("Scan the QR code below with Signal on your phone:");
+    println!("  Settings → Linked Devices → Link New Device\n");
+
+    let status = Command::new("signal-cli")
+        .args(["link", "--name", "signal-tui"])
+        .status()?;
+
+    if status.success() {
+        println!("\nLinked successfully. Starting signal-tui...\n");
+        Ok(())
+    } else {
+        Err(std::io::Error::other("linking failed or was cancelled"))
+    }
+}
+
 fn main() -> std::io::Result<()> {
+    if !is_linked() {
+        run_link()?;
+    }
+
     let mut child: Child = Command::new("signal-cli")
         .args(["--output=json", "jsonRpc"])
         .stdin(Stdio::piped())
