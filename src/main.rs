@@ -1,4 +1,5 @@
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use notify_rust::Notification;
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
@@ -234,7 +235,12 @@ fn handle_json(app: &mut App, v: &Value) {
                 .or(env["sourceNumber"].as_str())
                 .unwrap_or("?")
                 .to_string();
-            app.messages.push((cid, Msg { from, text: text.into() }));
+            app.messages.push((cid, Msg { from: from.clone(), text: text.into() }));
+            let _ = Notification::new()
+                .summary(&format!("Signal: {}", from))
+                .body(text)
+                .appname("signal-tui")
+                .show();
         }
     }
     if let Some(err) = v.get("error") {
@@ -284,13 +290,9 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         .map(|(_, m)| Line::from(format!("{}: {}", m.from, m.text)))
         .collect();
     let title = current.map(|c| c.name.clone()).unwrap_or_default();
-    let n = lines.len();
     let msgs = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
-        .scroll((
-            n.saturating_sub(right[0].height.saturating_sub(2) as usize) as u16,
-            0,
-        ))
+        .scroll((u16::MAX, 0))
         .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(msgs, right[0]);
 
