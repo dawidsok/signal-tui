@@ -81,7 +81,9 @@ signal-tui completions fish > ~/.config/fish/completions/signal-tui.fish
 |-----|--------|
 | Tab | Switch focus (contacts ↔ input) |
 | Up / Down | Navigate contacts (contacts focus) |
-| / | Search contacts; type a new number and Enter to start a chat |
+| / | Search the current chat/contact list |
+| n | Show contacts to start a new chat |
+| a | Toggle archived chats view |
 | i / Enter | Open selected chat |
 | f | Toggle favorite for selected/open chat |
 | Enter | Send message (input focus) |
@@ -89,6 +91,8 @@ signal-tui completions fish > ~/.config/fish/completions/signal-tui.fish
 | Ctrl-C | Quit (any focus) |
 
 A **Note to Self** chat is added automatically from your linked Signal account, so you can test without messaging other people.
+
+The left pane shows open chats by default, not every contact. Press `n` to browse contacts for a new chat, or `a` to view archived chats.
 
 Contact markers: `*` = unread, `★` = favorite.
 

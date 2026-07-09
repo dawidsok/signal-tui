@@ -33,17 +33,25 @@ const COMMANDS: &[(&str, &str)] = &[
     ("completions", "print shell completions: zsh, bash, fish"),
 ];
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum Focus {
     List,
     Search,
     Input,
 }
 
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum ListMode {
+    Chats,
+    Contacts,
+    Archived,
+}
+
 struct Contact {
     id: String, // phone number or groupId
     name: String,
     is_group: bool,
+    is_archived: bool,
 }
 
 struct Msg {
@@ -81,6 +89,7 @@ struct App {
     msg_seq: usize,
     input: String,
     focus: Focus,
+    list_mode: ListMode,
     search: String,
     connected: bool,
     // pending 'g' for 'gg' binding
@@ -94,14 +103,20 @@ struct App {
 impl App {
     fn filtered(&self) -> Vec<&Contact> {
         let q = self.search.to_lowercase();
-        let mut contacts: Vec<&Contact> = if q.is_empty() {
-            self.contacts.iter().collect()
-        } else {
-            self.contacts
-                .iter()
-                .filter(|c| c.name.to_lowercase().contains(&q) || c.id.to_lowercase().contains(&q))
-                .collect()
-        };
+        let mut contacts: Vec<&Contact> = self
+            .contacts
+            .iter()
+            .filter(|c| match self.list_mode {
+                ListMode::Chats => !c.is_archived && self.is_chat(c),
+                ListMode::Archived => c.is_archived && self.is_chat(c),
+                ListMode::Contacts => true,
+            })
+            .filter(|c| {
+                q.is_empty()
+                    || c.name.to_lowercase().contains(&q)
+                    || c.id.to_lowercase().contains(&q)
+            })
+            .collect();
         contacts.sort_by(|a, b| {
             let fa = self.favorites.contains(&a.id);
             let fb = self.favorites.contains(&b.id);
@@ -110,6 +125,14 @@ impl App {
             fb.cmp(&fa).then_with(|| sb.cmp(&sa))
         });
         contacts
+    }
+
+    fn is_chat(&self, c: &Contact) -> bool {
+        self.last_msg_seq.contains_key(&c.id)
+            || self.unread.contains(&c.id)
+            || self.favorites.contains(&c.id)
+            || self.open_id.as_deref() == Some(c.id.as_str())
+            || self.self_id.as_deref() == Some(c.id.as_str())
     }
 }
 
@@ -476,6 +499,7 @@ fn new_app(account: Option<String>, status: String) -> App {
         msg_seq: 0,
         input: String::new(),
         focus: Focus::List,
+        list_mode: ListMode::Chats,
         search: String::new(),
         connected: true,
         pending_g: false,
@@ -490,10 +514,10 @@ fn new_app(account: Option<String>, status: String) -> App {
         .map(|(id, _)| id.clone())
         .collect::<Vec<_>>()
     {
-        add_contact_once(&mut app, id.clone(), id, false);
+        add_contact_once(&mut app, id.clone(), id, false, false);
     }
     if let Some(account) = account {
-        add_contact_once(&mut app, account, "Note to Self".into(), false);
+        add_contact_once(&mut app, account, "Note to Self".into(), false, false);
     }
     app.selected.select(Some(0));
     app
@@ -662,6 +686,9 @@ fn run(
                     }
                     KeyCode::Esc => {
                         app.search.clear();
+                        if app.list_mode == ListMode::Contacts {
+                            app.list_mode = ListMode::Chats;
+                        }
                         app.focus = Focus::List;
                         clamp_selected(app);
                     }
@@ -705,6 +732,23 @@ fn run(
                         KeyCode::Char('q') => return Ok(()),
                         KeyCode::Char('/') => {
                             app.focus = Focus::Search;
+                            app.search.clear();
+                            app.selected.select(Some(0));
+                            false
+                        }
+                        KeyCode::Char('n') => {
+                            app.list_mode = ListMode::Contacts;
+                            app.focus = Focus::Search;
+                            app.search.clear();
+                            app.selected.select(Some(0));
+                            false
+                        }
+                        KeyCode::Char('a') => {
+                            app.list_mode = if app.list_mode == ListMode::Archived {
+                                ListMode::Chats
+                            } else {
+                                ListMode::Archived
+                            };
                             app.search.clear();
                             app.selected.select(Some(0));
                             false
@@ -765,9 +809,18 @@ fn clamp_selected(app: &mut App) {
     app.selected.select(Some(i));
 }
 
-fn add_contact_once(app: &mut App, id: String, name: String, is_group: bool) {
-    if !app.contacts.iter().any(|c| c.id == id) {
-        app.contacts.push(Contact { id, name, is_group });
+fn add_contact_once(app: &mut App, id: String, name: String, is_group: bool, is_archived: bool) {
+    if let Some(c) = app.contacts.iter_mut().find(|c| c.id == id) {
+        c.name = name;
+        c.is_group = is_group;
+        c.is_archived = is_archived;
+    } else {
+        app.contacts.push(Contact {
+            id,
+            name,
+            is_group,
+            is_archived,
+        });
     }
 }
 
@@ -811,12 +864,16 @@ fn toggle_favorite(app: &mut App) {
 }
 
 fn open_selected_contact(app: &mut App) {
+    let from_contacts = app.list_mode == ListMode::Contacts;
     if let Some(id) = app
         .selected
         .selected()
         .and_then(|i| app.filtered().get(i).map(|c| c.id.clone()))
     {
         open_chat(app, id);
+        if from_contacts {
+            app.list_mode = ListMode::Chats;
+        }
     } else {
         app.focus = Focus::Input;
     }
@@ -826,8 +883,9 @@ fn confirm_search(app: &mut App) {
     let q = app.search.trim().to_string();
     if app.filtered().is_empty() && !q.is_empty() {
         app.search = q.clone();
-        add_contact_once(app, q.clone(), q.clone(), false);
+        add_contact_once(app, q.clone(), q.clone(), false, false);
         open_chat(app, q.clone());
+        app.list_mode = ListMode::Chats;
         app.status = format!("new chat: {q}");
         app.selected.select(Some(0));
     } else {
@@ -967,8 +1025,9 @@ fn handle_command(app: &mut App, command: &str) {
         "/help" => app.status = "commands: /chat <number>, /self, /fav, /unfav".into(),
         "/chat" | "/new" => match parts.next() {
             Some(id) => {
-                add_contact_once(app, id.into(), id.into(), false);
+                add_contact_once(app, id.into(), id.into(), false, false);
                 open_chat(app, id.into());
+                app.list_mode = ListMode::Chats;
                 app.search.clear();
                 app.status = format!("chat: {id}");
             }
@@ -976,8 +1035,9 @@ fn handle_command(app: &mut App, command: &str) {
         },
         "/self" | "/me" => match app.self_id.clone() {
             Some(id) => {
-                add_contact_once(app, id.clone(), "Note to Self".into(), false);
+                add_contact_once(app, id.clone(), "Note to Self".into(), false, false);
                 open_chat(app, id);
+                app.list_mode = ListMode::Chats;
                 app.search.clear();
                 app.status = "chat: Note to Self".into();
             }
@@ -1133,7 +1193,11 @@ fn handle_json(app: &mut App, v: &Value) {
                         .and_then(|x| x.as_str())
                         .unwrap_or(gid)
                         .into();
-                    add_contact_once(app, gid.into(), name, true);
+                    let archived = item
+                        .get("isArchived")
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(false);
+                    add_contact_once(app, gid.into(), name, true, archived);
                 }
                 continue;
             }
@@ -1145,7 +1209,11 @@ fn handle_json(app: &mut App, v: &Value) {
                     .or_else(|| item.get("name").and_then(|x| x.as_str()))
                     .filter(|s| !s.is_empty())
                     .unwrap_or(number);
-                add_contact_once(app, number.into(), name.into(), false);
+                let archived = item
+                    .get("isArchived")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
+                add_contact_once(app, number.into(), name.into(), false, archived);
             }
         }
         app.status = format!("{} contacts", app.contacts.len());
@@ -1293,10 +1361,15 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         })
         .collect();
 
+    let base_title = match app.list_mode {
+        ListMode::Chats => "Chats",
+        ListMode::Contacts => "Contacts",
+        ListMode::Archived => "Archived",
+    };
     let list_title = if app.focus == Focus::Search {
-        format!("/ {}_", app.search)
+        format!("{base_title} / {}_", app.search)
     } else {
-        "Contacts".into()
+        base_title.into()
     };
     let list_active = matches!(app.focus, Focus::List | Focus::Search);
     let list = List::new(items)
@@ -1380,8 +1453,10 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         ("✗ disconnected", RED)
     };
     let mode_hint = match app.focus {
-        Focus::List => "j/k navigate · / search · f favorite · i/Enter compose · q quit",
-        Focus::Search => "type to filter/new chat · Enter confirm · Esc cancel",
+        Focus::List => {
+            "j/k navigate · / search · n new · a archived · f favorite · i/Enter open · q quit"
+        }
+        Focus::Search => "type to filter · Enter confirm/start chat · Esc cancel",
         Focus::Input => "Enter send · /help commands · Esc back",
     };
     let status_line = Line::from(vec![
@@ -1415,6 +1490,7 @@ mod tests {
             msg_seq: 0,
             input: String::new(),
             focus: Focus::List,
+            list_mode: ListMode::Chats,
             search: String::new(),
             connected: true,
             pending_g: false,
@@ -1431,6 +1507,7 @@ mod tests {
             id: id.into(),
             name: name.into(),
             is_group: false,
+            is_archived: false,
         });
     }
 
@@ -1439,6 +1516,7 @@ mod tests {
             id: id.into(),
             name: name.into(),
             is_group: true,
+            is_archived: false,
         });
     }
 
@@ -1532,6 +1610,7 @@ mod tests {
 
     /// Simulate pressing i/Enter on the currently highlighted contact.
     fn open_selected(app: &mut App) {
+        app.list_mode = ListMode::Contacts;
         open_selected_contact(app);
     }
 
@@ -1726,6 +1805,45 @@ mod tests {
     }
 
     #[test]
+    fn default_list_shows_chats_not_all_contacts() {
+        let mut app = make_app();
+        add_contact(&mut app, "+1", "Alice");
+        add_contact(&mut app, "+2", "Bob");
+        app.last_msg_seq.insert("+2".into(), 1);
+        let ids: Vec<&str> = app.filtered().iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["+2"]);
+    }
+
+    #[test]
+    fn contacts_mode_shows_all_contacts_for_new_chat() {
+        let mut app = make_app();
+        add_contact(&mut app, "+1", "Alice");
+        app.list_mode = ListMode::Contacts;
+        assert_eq!(app.filtered()[0].id, "+1");
+    }
+
+    #[test]
+    fn archived_mode_shows_archived_chats() {
+        let mut app = make_app();
+        add_contact(&mut app, "+1", "Alice");
+        app.contacts[0].is_archived = true;
+        app.last_msg_seq.insert("+1".into(), 1);
+        assert!(app.filtered().is_empty());
+        app.list_mode = ListMode::Archived;
+        assert_eq!(app.filtered()[0].id, "+1");
+    }
+
+    #[test]
+    fn opening_from_contacts_returns_to_chats() {
+        let mut app = make_app();
+        add_contact(&mut app, "+1", "Alice");
+        app.list_mode = ListMode::Contacts;
+        open_selected_contact(&mut app);
+        assert_eq!(app.list_mode, ListMode::Chats);
+        assert_eq!(app.open_id.as_deref(), Some("+1"));
+    }
+
+    #[test]
     fn confirm_search_starts_chat_when_no_contact_matches() {
         let mut app = make_app();
         add_contact(&mut app, "+1", "Alice");
@@ -1808,6 +1926,7 @@ mod tests {
         let mut app = make_app();
         add_contact(&mut app, "+1", "Alice");
         // never called open_selected — open_id stays None
+        app.list_mode = ListMode::Contacts;
         app.focus = Focus::Input;
         app.input = "hi".into();
         send_message(&mut app, &mut vec![], 1);
