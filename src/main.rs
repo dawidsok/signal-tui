@@ -1,0 +1,304 @@
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::{
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::Line,
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+};
+use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
+
+struct Contact {
+    id: String, // phone number or groupId
+    name: String,
+    is_group: bool,
+}
+
+struct Msg {
+    from: String,
+    text: String,
+}
+
+struct App {
+    contacts: Vec<Contact>,
+    selected: ListState,
+    // ponytail: all messages in one Vec, filter on render; fine until thousands of messages
+    messages: Vec<(String, Msg)>, // (contact_id, msg)
+    input: String,
+    focus_input: bool,
+    status: String,
+}
+
+fn rpc(stdin: &mut impl Write, id: u64, method: &str, params: Value) {
+    let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+    let _ = writeln!(stdin, "{}", req);
+}
+
+fn main() -> std::io::Result<()> {
+    let mut child: Child = Command::new("signal-cli")
+        .args(["--output=json", "jsonRpc"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            std::io::Error::other(format!(
+                "failed to start signal-cli ({e}); install: brew install signal-cli, then link/register account"
+            ))
+        })?;
+
+    let mut child_stdin = child.stdin.take().unwrap();
+    let child_stdout = child.stdout.take().unwrap();
+
+    let (tx, rx) = mpsc::channel::<Value>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(child_stdout).lines().map_while(Result::ok) {
+            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                if tx.send(v).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    rpc(&mut child_stdin, 1, "listContacts", json!({}));
+    rpc(&mut child_stdin, 2, "listGroups", json!({}));
+
+    let mut terminal = ratatui::init();
+    let mut app = App {
+        contacts: vec![],
+        selected: ListState::default(),
+        messages: vec![],
+        input: String::new(),
+        focus_input: true,
+        status: "loading contacts...".into(),
+    };
+    app.selected.select(Some(0));
+
+    let res = run(&mut terminal, &mut app, &rx, &mut child_stdin);
+    ratatui::restore();
+    let _ = child.kill();
+    res
+}
+
+fn run(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    rx: &mpsc::Receiver<Value>,
+    child_stdin: &mut impl Write,
+) -> std::io::Result<()> {
+    let mut next_id: u64 = 100;
+    loop {
+        while let Ok(v) = rx.try_recv() {
+            handle_json(app, &v);
+        }
+
+        terminal.draw(|f| draw(f, app))?;
+
+        if !event::poll(Duration::from_millis(100))? {
+            continue;
+        }
+        if let Event::Key(key) = event::read()? {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(())
+                }
+                KeyCode::Tab => app.focus_input = !app.focus_input,
+                KeyCode::Up if !app.focus_input => {
+                    let i = app.selected.selected().unwrap_or(0);
+                    app.selected.select(Some(i.saturating_sub(1)));
+                }
+                KeyCode::Down if !app.focus_input => {
+                    let i = app.selected.selected().unwrap_or(0);
+                    app.selected
+                        .select(Some((i + 1).min(app.contacts.len().saturating_sub(1))));
+                }
+                KeyCode::Enter if app.focus_input && !app.input.is_empty() => {
+                    if let Some(c) = app.selected.selected().and_then(|i| app.contacts.get(i)) {
+                        let params = if c.is_group {
+                            json!({"groupId": c.id, "message": app.input})
+                        } else {
+                            json!({"recipient": [c.id], "message": app.input})
+                        };
+                        rpc(child_stdin, next_id, "send", params);
+                        next_id += 1;
+                        app.messages.push((
+                            c.id.clone(),
+                            Msg {
+                                from: "me".into(),
+                                text: app.input.clone(),
+                            },
+                        ));
+                        app.input.clear();
+                    }
+                }
+                KeyCode::Backspace if app.focus_input => {
+                    app.input.pop();
+                }
+                KeyCode::Char('q') if !app.focus_input => return Ok(()),
+                KeyCode::Char(ch) if app.focus_input => app.input.push(ch),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn handle_json(app: &mut App, v: &Value) {
+    // contact/group list responses
+    if let Some(result) = v.get("result").and_then(|r| r.as_array()) {
+        for item in result {
+            if item.get("members").is_some() {
+                if let Some(gid) = item.get("id").and_then(|x| x.as_str()) {
+                    app.contacts.push(Contact {
+                        id: gid.into(),
+                        name: item
+                            .get("name")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or(gid)
+                            .into(),
+                        is_group: true,
+                    });
+                }
+                continue;
+            }
+            if let Some(number) = item.get("number").and_then(|x| x.as_str()) {
+                let name = item
+                    .get("profile")
+                    .and_then(|p| p.get("givenName"))
+                    .and_then(|x| x.as_str())
+                    .or_else(|| item.get("name").and_then(|x| x.as_str()))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(number);
+                app.contacts.push(Contact {
+                    id: number.into(),
+                    name: name.into(),
+                    is_group: false,
+                });
+            }
+        }
+        app.status = format!("{} contacts", app.contacts.len());
+    }
+    // incoming message notification
+    if v.get("method").and_then(|m| m.as_str()) == Some("receive") {
+        let env = &v["params"]["envelope"];
+        let from = env["sourceName"]
+            .as_str()
+            .or(env["sourceNumber"].as_str())
+            .unwrap_or("?")
+            .to_string();
+        let dm = &env["dataMessage"];
+        if let Some(text) = dm["message"].as_str() {
+            let cid = dm["groupInfo"]["groupId"]
+                .as_str()
+                .or(env["sourceNumber"].as_str())
+                .unwrap_or("?")
+                .to_string();
+            app.messages.push((cid, Msg { from, text: text.into() }));
+        }
+    }
+    if let Some(err) = v.get("error") {
+        app.status = format!("error: {}", err["message"].as_str().unwrap_or("rpc error"));
+    }
+}
+
+fn draw(f: &mut ratatui::Frame, app: &mut App) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(28), Constraint::Min(1)])
+        .split(f.area());
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(cols[1]);
+
+    let items: Vec<ListItem> = app
+        .contacts
+        .iter()
+        .map(|c| {
+            ListItem::new(if c.is_group {
+                format!("# {}", c.name)
+            } else {
+                c.name.clone()
+            })
+        })
+        .collect();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(if app.focus_input {
+            "Contacts (Tab)"
+        } else {
+            "Contacts *"
+        }))
+        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+    f.render_stateful_widget(list, cols[0], &mut app.selected);
+
+    let current = app.selected.selected().and_then(|i| app.contacts.get(i));
+    let lines: Vec<Line> = app
+        .messages
+        .iter()
+        .filter(|(cid, _)| current.map(|c| &c.id == cid).unwrap_or(false))
+        .map(|(_, m)| Line::from(format!("{}: {}", m.from, m.text)))
+        .collect();
+    let title = current.map(|c| c.name.clone()).unwrap_or_default();
+    let n = lines.len();
+    let msgs = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((
+            n.saturating_sub(right[0].height.saturating_sub(2) as usize) as u16,
+            0,
+        ))
+        .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(msgs, right[0]);
+
+    let input = Paragraph::new(app.input.as_str()).block(
+        Block::default().borders(Borders::ALL).title(if app.focus_input {
+            "Message *"
+        } else {
+            "Message (Tab)"
+        }),
+    );
+    f.render_widget(input, right[1]);
+
+    f.render_widget(
+        Paragraph::new(format!(
+            " {} | Tab: switch focus | Enter: send | q (list focus)/Ctrl-C: quit",
+            app.status
+        ))
+        .style(Style::default().fg(Color::DarkGray)),
+        right[2],
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_incoming_message() {
+        let mut app = App {
+            contacts: vec![],
+            selected: ListState::default(),
+            messages: vec![],
+            input: String::new(),
+            focus_input: true,
+            status: String::new(),
+        };
+        let v: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"receive","params":{"envelope":{"sourceNumber":"+48123","sourceName":"Bob","dataMessage":{"message":"hi"}}}}"#,
+        )
+        .unwrap();
+        handle_json(&mut app, &v);
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].0, "+48123");
+        assert_eq!(app.messages[0].1.text, "hi");
+    }
+}
