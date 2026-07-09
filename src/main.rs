@@ -56,6 +56,8 @@ struct App {
     connected: bool,
     // pending 'g' for 'gg' binding
     pending_g: bool,
+    // open chat contact id — decoupled from list sort index
+    open_id: Option<String>,
     status: String,
 }
 
@@ -157,6 +159,7 @@ fn main() -> std::io::Result<()> {
         search: String::new(),
         connected: true,
         pending_g: false,
+        open_id: None,
         status: "loading contacts...".into(),
     };
     app.selected.select(Some(0));
@@ -244,6 +247,10 @@ fn run(
                             false
                         }
                         KeyCode::Char('i') | KeyCode::Enter => {
+                            app.open_id = app
+                                .selected
+                                .selected()
+                                .and_then(|i| app.filtered().get(i).map(|c| c.id.clone()));
                             app.focus = Focus::Input;
                             false
                         }
@@ -283,26 +290,21 @@ fn clamp_selected(app: &mut App) {
 }
 
 fn send_message(app: &mut App, child_stdin: &mut impl Write, next_id: u64) {
-    let contact = app
-        .selected
-        .selected()
-        .and_then(|i| app.filtered().get(i).map(|c| (c.id.clone(), c.is_group)));
-    if let Some((id, is_group)) = contact {
-        let params = if is_group {
-            json!({"groupId": id, "message": app.input})
-        } else {
-            json!({"recipient": [id], "message": app.input})
-        };
-        rpc(child_stdin, next_id, "send", params);
-        app.msg_seq += 1;
-        app.last_msg_seq.insert(id.clone(), app.msg_seq);
-        app.messages.push((id.clone(), Msg { from: "me".into(), text: app.input.clone() }));
-        app.input.clear();
-        // re-select after sort order may have changed
-        if let Some(new_idx) = app.filtered().iter().position(|c| c.id == id) {
-            app.selected.select(Some(new_idx));
-        }
-    }
+    let open_id = match app.open_id.clone() {
+        Some(id) => id,
+        None => return,
+    };
+    let is_group = app.contacts.iter().find(|c| c.id == open_id).map(|c| c.is_group).unwrap_or(false);
+    let params = if is_group {
+        json!({"groupId": open_id, "message": app.input})
+    } else {
+        json!({"recipient": [open_id], "message": app.input})
+    };
+    rpc(child_stdin, next_id, "send", params);
+    app.msg_seq += 1;
+    app.last_msg_seq.insert(open_id.clone(), app.msg_seq);
+    app.messages.push((open_id, Msg { from: "me".into(), text: app.input.clone() }));
+    app.input.clear();
 }
 
 fn handle_json(app: &mut App, v: &Value) {
@@ -359,16 +361,6 @@ fn handle_json(app: &mut App, v: &Value) {
             let seq = app.msg_seq;
             app.last_msg_seq.insert(cid.clone(), seq);
             app.messages.push((cid.clone(), Msg { from: from.clone(), text: text.into() }));
-            // keep selected contact stable after re-sort
-            let current_id = app
-                .selected
-                .selected()
-                .and_then(|i| app.filtered().get(i).map(|c| c.id.clone()));
-            if let Some(cur) = current_id {
-                if let Some(new_idx) = app.filtered().iter().position(|c| c.id == cur) {
-                    app.selected.select(Some(new_idx));
-                }
-            }
             let _ = Notification::new()
                 .summary(&format!("Signal: {}", from))
                 .body(text)
@@ -438,11 +430,19 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     f.render_stateful_widget(list, cols[0], &mut app.selected);
 
     // --- messages ---
-    let current = app.selected.selected().and_then(|i| filtered.get(i).cloned());
+    // use open_id for chat — stable across re-sorts; fall back to highlighted contact when in List focus
+    let chat_id: Option<String> = app.open_id.clone().or_else(|| {
+        app.selected.selected().and_then(|i| filtered.get(i).map(|(id, _, _)| id.clone()))
+    });
+    let chat_title = chat_id
+        .as_ref()
+        .and_then(|id| filtered.iter().find(|(fid, _, _)| fid == id).map(|(_, n, _)| n.clone()))
+        .or_else(|| chat_id.as_ref().and_then(|id| app.contacts.iter().find(|c| &c.id == id).map(|c| c.name.clone())))
+        .unwrap_or_default();
     let lines: Vec<Line> = app
         .messages
         .iter()
-        .filter(|(cid, _)| current.as_ref().map(|(id, _, _)| id == cid).unwrap_or(false))
+        .filter(|(cid, _)| chat_id.as_ref().map(|id| id == cid).unwrap_or(false))
         .map(|(_, m)| {
             let color = if m.from == "me" { BLUE } else { GREEN };
             Line::from(vec![
@@ -451,7 +451,6 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
             ])
         })
         .collect();
-    let chat_title = current.as_ref().map(|(_, name, _)| name.clone()).unwrap_or_default();
     let msgs = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((u16::MAX, 0))
@@ -517,6 +516,7 @@ mod tests {
             search: String::new(),
             connected: true,
             pending_g: false,
+            open_id: None,
             status: String::new(),
         }
     }
