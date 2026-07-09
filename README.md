@@ -56,6 +56,25 @@ Check daemon state:
 signal-tui status
 ```
 
+Show CLI help:
+
+```sh
+signal-tui help
+```
+
+Shell completions:
+
+```sh
+# zsh
+source <(signal-tui completions zsh)
+
+# bash
+source <(signal-tui completions bash)
+
+# fish
+signal-tui completions fish > ~/.config/fish/completions/signal-tui.fish
+```
+
 ## Keys
 
 | Key | Action |

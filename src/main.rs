@@ -26,6 +26,12 @@ const GREEN: Color = Color::Rgb(0x87, 0x96, 0x5f);
 const RED: Color = Color::Rgb(0xa8, 0x5f, 0x59);
 const BLUE: Color = Color::Rgb(0x6f, 0x8f, 0xaf);
 const MAX_EVENTS_PER_TICK: usize = 25;
+const COMMANDS: &[(&str, &str)] = &[
+    ("daemon", "run the background receiver"),
+    ("status", "print background receiver status"),
+    ("help", "print this help"),
+    ("completions", "print shell completions: zsh, bash, fish"),
+];
 
 #[derive(PartialEq, Clone, Copy)]
 enum Focus {
@@ -355,6 +361,81 @@ fn linked_account() -> Option<String> {
 
 /// Run signal-cli link in foreground, printing the QR code to the terminal.
 /// Blocks until the user scans and the link is confirmed (process exits).
+fn help_text() -> String {
+    let mut s = "signal-tui [COMMAND]\n\nCommands:\n".to_string();
+    for (cmd, desc) in COMMANDS {
+        s.push_str(&format!("  {cmd:<12} {desc}\n"));
+    }
+    s.push_str("\nWith no command, opens the TUI.\n");
+    s
+}
+
+fn print_help() {
+    print!("{}", help_text());
+}
+
+fn completion_script(shell: &str) -> Option<&'static str> {
+    match shell {
+        "zsh" => Some(
+            r#"#compdef signal-tui
+_signal_tui() {
+  local -a commands shells
+  commands=(
+    'daemon:run the background receiver'
+    'status:print background receiver status'
+    'help:print help'
+    'completions:print shell completions'
+  )
+  shells=('zsh:Zsh completions' 'bash:Bash completions' 'fish:Fish completions')
+  if (( CURRENT == 2 )); then
+    _describe 'command' commands
+  elif [[ ${words[2]} == completions ]]; then
+    _describe 'shell' shells
+  fi
+}
+compdef _signal_tui signal-tui
+"#,
+        ),
+        "bash" => Some(
+            r#"_signal_tui() {
+  local cur prev
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+  if [[ "$prev" == "completions" ]]; then
+    COMPREPLY=( $(compgen -W "zsh bash fish" -- "$cur") )
+  else
+    COMPREPLY=( $(compgen -W "daemon status help completions" -- "$cur") )
+  fi
+}
+complete -F _signal_tui signal-tui
+"#,
+        ),
+        "fish" => Some(
+            r#"complete -c signal-tui -f -a "daemon" -d "run the background receiver"
+complete -c signal-tui -f -a "status" -d "print background receiver status"
+complete -c signal-tui -f -a "help" -d "print help"
+complete -c signal-tui -f -a "completions" -d "print shell completions"
+complete -c signal-tui -n "__fish_seen_subcommand_from completions" -f -a "zsh bash fish"
+"#,
+        ),
+        _ => None,
+    }
+}
+
+fn print_completions(shell: &str) -> std::io::Result<()> {
+    match completion_script(shell) {
+        Some(script) => {
+            print!("{script}");
+            Ok(())
+        }
+        None => Err(std::io::Error::other(
+            "usage: signal-tui completions [zsh|bash|fish]",
+        )),
+    }
+}
+
+/// Run signal-cli link in foreground, printing the QR code to the terminal.
+/// Blocks until the user scans and the link is confirmed (process exits).
 fn run_link() -> std::io::Result<()> {
     println!("No Signal account linked. Starting device linking...\n");
     println!("Scan the QR code below with Signal on your phone:");
@@ -455,7 +536,18 @@ fn main() -> std::io::Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("daemon") => run_daemon(),
         Some("status") => print_status(),
-        Some(other) => Err(std::io::Error::other(format!("unknown command: {other}"))),
+        Some("help") | Some("--help") | Some("-h") => {
+            print_help();
+            Ok(())
+        }
+        Some("completions") | Some("completion") => {
+            let shell = std::env::args().nth(2).unwrap_or_else(|| "zsh".into());
+            print_completions(&shell)
+        }
+        Some(other) => Err(std::io::Error::other(format!(
+            "unknown command: {other}\n\n{}",
+            help_text()
+        ))),
         None => run_tui(),
     }
 }
@@ -1356,6 +1448,26 @@ mod tests {
             parse_linked_account(r#"[{"number":"+123"}]"#).as_deref(),
             Some("+123")
         );
+    }
+
+    #[test]
+    fn cli_help_lists_commands() {
+        let help = help_text();
+        assert!(help.contains("daemon"));
+        assert!(help.contains("status"));
+        assert!(help.contains("completions"));
+    }
+
+    #[test]
+    fn completion_scripts_include_commands() {
+        assert!(completion_script("zsh").unwrap().contains("daemon"));
+        assert!(completion_script("bash").unwrap().contains("complete -F"));
+        assert!(
+            completion_script("fish")
+                .unwrap()
+                .contains("complete -c signal-tui")
+        );
+        assert!(completion_script("nope").is_none());
     }
 
     fn temp_path(name: &str) -> PathBuf {
