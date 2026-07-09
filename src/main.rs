@@ -1310,6 +1310,36 @@ fn border_style(active: bool) -> Style {
     }
 }
 
+fn wrapped_rows(text: &str, width: usize) -> usize {
+    let width = width.max(1);
+    text.split('\n')
+        .map(|line| line.chars().count().max(1).div_ceil(width))
+        .sum::<usize>()
+        .max(1)
+}
+
+fn wrap_chunks(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = vec![];
+    for line in text.split('\n') {
+        let mut row = String::new();
+        let mut len = 0;
+        for ch in line.chars() {
+            row.push(ch);
+            len += 1;
+            if len == width {
+                rows.push(row);
+                row = String::new();
+                len = 0;
+            }
+        }
+        if !row.is_empty() || line.is_empty() {
+            rows.push(row);
+        }
+    }
+    rows
+}
+
 fn draw(f: &mut ratatui::Frame, app: &mut App) {
     // fill background
     f.render_widget(Block::default().style(Style::default().bg(BG)), f.area());
@@ -1318,11 +1348,21 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(28), Constraint::Min(1)])
         .split(f.area());
+    let input_active = app.focus == Focus::Input;
+    let input_width = cols[1].width.saturating_sub(2).max(1) as usize;
+    let input_display = if input_active {
+        format!("{}▌", app.input)
+    } else {
+        app.input.clone()
+    };
+    let input_rows_total = wrapped_rows(&input_display, input_width);
+    let input_rows_visible = input_rows_total.min(6);
+    let input_height = input_rows_visible as u16 + 2;
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
-            Constraint::Length(3),
+            Constraint::Length(input_height),
             Constraint::Length(1),
         ])
         .split(cols[1]);
@@ -1401,17 +1441,14 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         })
         .unwrap_or_default();
     let msgs_buf: Vec<&Msg> = chat_messages(app, &filtered);
+    let msg_width = right[0].width.saturating_sub(2).max(1) as usize;
     let lines: Vec<Line> = msgs_buf
         .iter()
-        .map(|m| {
+        .flat_map(|m| {
             let color = if m.from == "me" { BLUE } else { GREEN };
-            Line::from(vec![
-                Span::styled(
-                    format!("{}: ", m.from),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(m.text.clone(), Style::default().fg(FG)),
-            ])
+            wrap_chunks(&format!("{}: {}", m.from, m.text), msg_width)
+                .into_iter()
+                .map(move |s| Line::from(Span::styled(s, Style::default().fg(color))))
         })
         .collect();
     let msg_scroll = lines
@@ -1431,9 +1468,20 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     f.render_widget(msgs, right[0]);
 
     // --- input ---
-    let input_active = app.focus == Focus::Input;
-    let input = Paragraph::new(app.input.as_str())
+    let input_scroll = input_rows_total
+        .saturating_sub(input_rows_visible)
+        .min(u16::MAX as usize) as u16;
+    let input_text = Line::from(vec![
+        Span::styled(app.input.clone(), Style::default().fg(FG)),
+        Span::styled(
+            if input_active { "▌" } else { "" },
+            Style::default().fg(DIM),
+        ),
+    ]);
+    let input = Paragraph::new(input_text)
         .style(Style::default().fg(FG))
+        .wrap(Wrap { trim: false })
+        .scroll((input_scroll, 0))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -1756,7 +1804,11 @@ mod tests {
     }
 
     fn screen_text(app: &mut App) -> String {
-        let backend = ratatui::backend::TestBackend::new(80, 20);
+        screen_text_size(app, 80, 20)
+    }
+
+    fn screen_text_size(app: &mut App, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, app)).unwrap();
         terminal
@@ -1777,6 +1829,45 @@ mod tests {
         app.input = "hello".into();
         send_message(&mut app, &mut vec![], 1);
         assert!(screen_text(&mut app).contains("hello"));
+    }
+
+    #[test]
+    fn draw_scrolls_to_latest_wrapped_message() {
+        let mut app = make_app();
+        add_contact(&mut app, "+1", "Alice");
+        open_selected(&mut app);
+        for i in 0..8 {
+            record_ephemeral_message(
+                &mut app,
+                "+1".into(),
+                "Bob".into(),
+                "a long message that wraps over several terminal rows",
+                format!("old:{i}"),
+            );
+        }
+        record_ephemeral_message(
+            &mut app,
+            "+1".into(),
+            "Bob".into(),
+            "LATEST",
+            "latest".into(),
+        );
+        assert!(screen_text_size(&mut app, 50, 10).contains("LATEST"));
+    }
+
+    #[test]
+    fn input_wraps_long_messages() {
+        let mut app = make_app();
+        app.focus = Focus::Input;
+        app.input = "abcdefghijklmnopqrstuvwxyz".into();
+        assert!(screen_text_size(&mut app, 45, 10).contains("qrstuv"));
+    }
+
+    #[test]
+    fn input_shows_cursor_when_focused() {
+        let mut app = make_app();
+        app.focus = Focus::Input;
+        assert!(screen_text(&mut app).contains("▌"));
     }
 
     #[test]
