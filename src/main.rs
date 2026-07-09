@@ -7,6 +7,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -28,9 +29,32 @@ struct App {
     selected: ListState,
     // ponytail: all messages in one Vec, filter on render; fine until thousands of messages
     messages: Vec<(String, Msg)>, // (contact_id, msg)
+    // monotonic counter per contact: higher = more recently messaged
+    last_msg_seq: HashMap<String, usize>,
+    msg_seq: usize,
     input: String,
     focus_input: bool,
+    search: String,
+    searching: bool,
     status: String,
+}
+
+impl App {
+    fn filtered(&self) -> Vec<&Contact> {
+        let q = self.search.to_lowercase();
+        let mut contacts: Vec<&Contact> = if q.is_empty() {
+            self.contacts.iter().collect()
+        } else {
+            self.contacts.iter().filter(|c| c.name.to_lowercase().contains(&q)).collect()
+        };
+        // sort by most recently messaged; contacts never messaged go to bottom
+        contacts.sort_by(|a, b| {
+            let sa = self.last_msg_seq.get(&a.id).copied().unwrap_or(0);
+            let sb = self.last_msg_seq.get(&b.id).copied().unwrap_or(0);
+            sb.cmp(&sa)
+        });
+        contacts
+    }
 }
 
 fn rpc(stdin: &mut impl Write, id: u64, method: &str, params: Value) {
@@ -108,8 +132,12 @@ fn main() -> std::io::Result<()> {
         contacts: vec![],
         selected: ListState::default(),
         messages: vec![],
+        last_msg_seq: HashMap::new(),
+        msg_seq: 0,
         input: String::new(),
         focus_input: true,
+        search: String::new(),
+        searching: false,
         status: "loading contacts...".into(),
     };
     app.selected.select(Some(0));
@@ -145,31 +173,59 @@ fn run(
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return Ok(())
                 }
-                KeyCode::Tab => app.focus_input = !app.focus_input,
+                KeyCode::Esc if app.searching => {
+                    app.search.clear();
+                    app.searching = false;
+                    let max = app.filtered().len().saturating_sub(1);
+                    let i = app.selected.selected().unwrap_or(0).min(max);
+                    app.selected.select(Some(i));
+                }
+                KeyCode::Backspace if app.searching => {
+                    app.search.pop();
+                    let max = app.filtered().len().saturating_sub(1);
+                    let i = app.selected.selected().unwrap_or(0).min(max);
+                    app.selected.select(Some(i));
+                }
+                KeyCode::Char(ch) if app.searching => {
+                    app.search.push(ch);
+                    app.selected.select(Some(0));
+                }
+                KeyCode::Char('/') if !app.focus_input && !app.searching => {
+                    app.searching = true;
+                    app.search.clear();
+                    app.selected.select(Some(0));
+                }
+                KeyCode::Tab => {
+                    app.focus_input = !app.focus_input;
+                    app.searching = false;
+                }
                 KeyCode::Up if !app.focus_input => {
                     let i = app.selected.selected().unwrap_or(0);
                     app.selected.select(Some(i.saturating_sub(1)));
                 }
                 KeyCode::Down if !app.focus_input => {
                     let i = app.selected.selected().unwrap_or(0);
-                    app.selected
-                        .select(Some((i + 1).min(app.contacts.len().saturating_sub(1))));
+                    let max = app.filtered().len().saturating_sub(1);
+                    app.selected.select(Some((i + 1).min(max)));
                 }
                 KeyCode::Enter if app.focus_input && !app.input.is_empty() => {
-                    if let Some(c) = app.selected.selected().and_then(|i| app.contacts.get(i)) {
-                        let params = if c.is_group {
-                            json!({"groupId": c.id, "message": app.input})
+                    let contact_id = app
+                        .selected
+                        .selected()
+                        .and_then(|i| app.filtered().get(i).map(|c| (c.id.clone(), c.is_group)));
+                    if let Some((id, is_group)) = contact_id {
+                        let params = if is_group {
+                            json!({"groupId": id, "message": app.input})
                         } else {
-                            json!({"recipient": [c.id], "message": app.input})
+                            json!({"recipient": [id], "message": app.input})
                         };
                         rpc(child_stdin, next_id, "send", params);
                         next_id += 1;
+                        app.msg_seq += 1;
+                        app.last_msg_seq.insert(id.clone(), app.msg_seq);
                         app.messages.push((
-                            c.id.clone(),
-                            Msg {
-                                from: "me".into(),
-                                text: app.input.clone(),
-                            },
+                            id,
+                            Msg { from: "me".into(), text: app.input.clone() },
                         ));
                         app.input.clear();
                     }
@@ -235,6 +291,9 @@ fn handle_json(app: &mut App, v: &Value) {
                 .or(env["sourceNumber"].as_str())
                 .unwrap_or("?")
                 .to_string();
+            app.msg_seq += 1;
+            let seq = app.msg_seq;
+            app.last_msg_seq.insert(cid.clone(), seq);
             app.messages.push((cid, Msg { from: from.clone(), text: text.into() }));
             let _ = Notification::new()
                 .summary(&format!("Signal: {}", from))
@@ -262,34 +321,42 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         ])
         .split(cols[1]);
 
-    let items: Vec<ListItem> = app
-        .contacts
+    // ponytail: collect to break borrow before render_stateful_widget needs &mut app.selected
+    let filtered: Vec<(String, String, bool)> = app
+        .filtered()
+        .into_iter()
+        .map(|c| (c.id.clone(), c.name.clone(), c.is_group))
+        .collect();
+    let items: Vec<ListItem> = filtered
         .iter()
-        .map(|c| {
-            ListItem::new(if c.is_group {
-                format!("# {}", c.name)
+        .map(|(_, name, is_group)| {
+            ListItem::new(if *is_group {
+                format!("# {}", name)
             } else {
-                c.name.clone()
+                name.clone()
             })
         })
         .collect();
+    let list_title = if app.searching {
+        format!("/ {}_", app.search)
+    } else if app.focus_input {
+        "Contacts (Tab)".into()
+    } else {
+        "Contacts * (/ search)".into()
+    };
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(if app.focus_input {
-            "Contacts (Tab)"
-        } else {
-            "Contacts *"
-        }))
+        .block(Block::default().borders(Borders::ALL).title(list_title))
         .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
     f.render_stateful_widget(list, cols[0], &mut app.selected);
 
-    let current = app.selected.selected().and_then(|i| app.contacts.get(i));
+    let current = app.selected.selected().and_then(|i| filtered.get(i).cloned());
     let lines: Vec<Line> = app
         .messages
         .iter()
-        .filter(|(cid, _)| current.map(|c| &c.id == cid).unwrap_or(false))
+        .filter(|(cid, _)| current.as_ref().map(|(id, _, _)| id == cid).unwrap_or(false))
         .map(|(_, m)| Line::from(format!("{}: {}", m.from, m.text)))
         .collect();
-    let title = current.map(|c| c.name.clone()).unwrap_or_default();
+    let title = current.as_ref().map(|(_, name, _)| name.clone()).unwrap_or_default();
     let msgs = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((u16::MAX, 0))
@@ -325,8 +392,12 @@ mod tests {
             contacts: vec![],
             selected: ListState::default(),
             messages: vec![],
+            last_msg_seq: HashMap::new(),
+            msg_seq: 0,
             input: String::new(),
             focus_input: true,
+            search: String::new(),
+            searching: false,
             status: String::new(),
         };
         let v: Value = serde_json::from_str(
